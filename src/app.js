@@ -67,7 +67,8 @@ v1.use('/seller', sellerRoutes);
 v1.use('/admin', adminRoutes);
 app.use('/api/v1', v1);
 // Référencement : robots.txt, sitemap.xml et aperçus des liens partagés (/partage/...)
-app.use('/', seoRoutes);
+// (préfixe /api : voir withApiPrefix dans server.js)
+app.use('/api', seoRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
