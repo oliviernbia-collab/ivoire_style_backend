@@ -593,14 +593,28 @@ export async function autoPayoutShop(shopId) {
   const shop = await queryOne(`SELECT id, name, status, payout_method, payout_account FROM shops WHERE id = ?`, [shopId]);
   if (!shop || !['approved', 'suspended'].includes(shop.status)) return null;
   if (!jeko.JEKO_METHODS[shop.payout_method] || !jeko.jekoPhone(shop.payout_account)) return null;
+  // Échec récent dû au numéro du vendeur : pas de nouvel essai pendant 24 h (un manque de solde, lui, ne bloque pas)
   const recentFailure = await queryOne(
-    `SELECT id FROM seller_payouts WHERE shop_id = ? AND status = 'failed' AND created_at > NOW() - INTERVAL 1 DAY LIMIT 1`, [shopId]);
+    `SELECT id FROM seller_payouts WHERE shop_id = ? AND status = 'failed' AND created_at > NOW() - INTERVAL 1 DAY
+        AND (failure_reason IS NULL OR failure_reason NOT LIKE 'Solde Jèko%') LIMIT 1`, [shopId]);
   if (recentFailure) return null;
   const delayDays = Number(s.payout_delay_days ?? 0);
   const balance = await shopPayableBalance(pool, shopId, delayDays);
   if (jeko.toCents(balance) < 500) return null; // minimum de virement Jèko : 5 FCFA
+  let amount = balance;
+  let partial = false;
   const storeBalance = await jeko.getStoreBalance().catch(() => null);
-  if (storeBalance != null && storeBalance < jeko.toCents(balance)) {
+  if (storeBalance != null) {
+    // Les frais Jèko (encaissement puis virement) peuvent laisser le solde du magasin un peu sous la part du vendeur :
+    // on lui verse tout de suite ce que le solde permet (réserve pour les frais de virement), le reste partira ensuite.
+    const reserve = Math.max(2, Math.ceil(Number(balance) * 0.02));
+    const available = Math.floor(jeko.fromCents(storeBalance)) - reserve;
+    if (available < Number(balance)) {
+      partial = true;
+      amount = money(available);
+    }
+  }
+  if (jeko.toCents(amount) < 500) {
     // Une seule alerte par jour à l'administration
     const alerted = await queryOne(
       `SELECT id FROM notifications WHERE title = ? AND created_at > NOW() - INTERVAL 1 DAY LIMIT 1`, [PAYOUT_LOW_BALANCE]);
@@ -615,7 +629,9 @@ export async function autoPayoutShop(shopId) {
   }
   let payout;
   try {
-    payout = await createPayout(shopId, balance, 'Reversement automatique après livraison', null, { delayDays });
+    payout = await createPayout(shopId, amount,
+      partial ? `Reversement automatique partiel (reste ${money(balance - amount)} FCFA à verser)` : 'Reversement automatique après livraison',
+      null, { delayDays });
   } catch {
     return null; // solde modifié entre-temps : le prochain passage s'en chargera
   }
@@ -653,6 +669,12 @@ async function sendTransfer(kind, id, params, actorId) {
     if (kind === 'refund' && e.jekoId === 'insufficient_balance') {
       const r = await queryOne(`SELECT r.id, r.amount, o.id AS order_id, o.order_number FROM refunds r JOIN orders o ON o.id = r.order_id WHERE r.id = ?`, [id]);
       return waitForBalance(r.id, r.amount, { id: r.order_id, order_number: r.order_number });
+    }
+    // Reversement refusé faute de solde (frais de virement) : il est annulé sans alerte, le montant reste dû au
+    // vendeur et repartira automatiquement au prochain passage
+    if (kind === 'payout' && e.jekoId === 'insufficient_balance') {
+      await query(`UPDATE seller_payouts SET status = 'failed', failure_reason = 'Solde Jèko insuffisant (nouvel essai automatique)' WHERE id = ? AND status = 'pending'`, [id]);
+      return { amount: Number(params.amount), status: 'waiting' };
     }
     await applyTransferResult(params.reference, 'error', null, e.message, kind);
     e.adminsNotified = true; // applyTransferResult a déjà prévenu l'administration

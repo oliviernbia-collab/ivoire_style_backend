@@ -150,6 +150,12 @@ try {
     ['refund_fee_rate', '3', 'Frais de remboursement (%) conservés par la plateforme sur chaque remboursement']);
   if (rf.affectedRows) { console.log('✔ Paramètre refund_fee_rate = 3'); changes++; }
 
+  // Commission vendeur : 5 % du prix enregistré par le vendeur, retenus au reversement (en plus des 5 % payés par le client)
+  await addColumn('orders', 'seller_commission', 'DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER platform_fee');
+  const [sc] = await conn.query(`INSERT IGNORE INTO platform_settings (setting_key, setting_value, description) VALUES (?, ?, ?)`,
+    ['seller_commission_rate', '5', 'Commission vendeur (%) retenue au reversement sur le prix enregistré du produit (hors livraison)']);
+  if (sc.affectedRows) { console.log('✔ Paramètre seller_commission_rate = 5'); changes++; }
+
   // Reversements automatiques aux vendeurs après livraison
   for (const [k, v, d] of [
     ['auto_payouts', '1', 'Reversements automatiques aux vendeurs après livraison via Jèko (1 = oui, 0 = non)'],

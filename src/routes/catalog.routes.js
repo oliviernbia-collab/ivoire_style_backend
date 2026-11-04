@@ -203,6 +203,7 @@ router.get('/settings/public', async (_req, res) => {
   ok(res, {
     // Modèle : frais plateforme ajoutés au prix ; paiement total, moitié, ou acompte pour le paiement à la livraison
     platform_fee_rate: rates.fee,
+    seller_commission_rate: rates.sellerCommission,
     deposit_rate: rates.deposit,
     half_payment_rate: rates.half,
     cash_on_delivery: rates.cashOnDelivery,

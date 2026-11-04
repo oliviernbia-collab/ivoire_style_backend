@@ -297,6 +297,7 @@ CREATE TABLE orders (
   promotion_id     INT UNSIGNED NULL,
   promo_code       VARCHAR(40) NULL,
   platform_fee     DECIMAL(12,2) NOT NULL DEFAULT 0, -- part plateforme (+5 % sur les produits)
+  seller_commission DECIMAL(12,2) NOT NULL DEFAULT 0,   -- commission vendeur (% du prix du produit) retenue au reversement
   delivery_fee     DECIMAL(12,2) NOT NULL DEFAULT 0,
   total_amount     DECIMAL(12,2) NOT NULL,
   upfront_amount   DECIMAL(12,2) NOT NULL DEFAULT 0, -- payé en ligne à la commande

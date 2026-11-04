@@ -23,6 +23,8 @@ export async function pricingRates() {
     half: Number(s.half_payment_rate ?? 50),
     cashOnDelivery: String(s.payment_methods || '').split(',').includes('cash_on_delivery'),
     refundFee: Number(s.refund_fee_rate ?? 3),
+    // Commission vendeur : % du prix enregistré par le vendeur, retenu au reversement (hors livraison)
+    sellerCommission: Number(s.seller_commission_rate ?? 5),
   };
 }
 

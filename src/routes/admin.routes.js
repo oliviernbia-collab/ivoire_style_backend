@@ -48,6 +48,9 @@ router.get('/dashboard', adminOnly, async (_req, res) => {
   const commissions = await queryOne(
     `SELECT COALESCE(SUM(commission_amount), 0) AS total FROM order_items WHERE fulfillment_status NOT IN ('pending','cancelled','refunded')`);
   const refunds = await queryOne(`SELECT COALESCE(SUM(amount), 0) AS total, COALESCE(SUM(fee_amount), 0) AS fees FROM refunds WHERE status = 'succeeded'`);
+  // Commission vendeur (5 % du prix des produits) des commandes payées et non annulées
+  const sellerCommissions = await queryOne(
+    `SELECT COALESCE(SUM(seller_commission), 0) AS total FROM orders WHERE status NOT IN ('pending','cancelled','refunding','refunded')`);
   const due = await queryOne(`SELECT
       (SELECT COALESCE(SUM(amount), 0) FROM seller_ledger_entries) -
       (SELECT COALESCE(SUM(amount), 0) FROM seller_payouts WHERE status IN ('paid','pending')) AS amount`);
@@ -68,7 +71,8 @@ router.get('/dashboard', adminOnly, async (_req, res) => {
     promo_discounts: Number(money1.discounts),
     // Frais de remboursement (3 %) conservés par la plateforme lors des annulations
     refund_fees: Number(refunds.fees),
-    net_revenue: money(Number(commissions.total) + Number(refunds.fees) - Number(money1.discounts)),
+    seller_commissions: Number(sellerCommissions.total),
+    net_revenue: money(Number(commissions.total) + Number(sellerCommissions.total) + Number(refunds.fees) - Number(money1.discounts)),
     active_promotions: activePromos.n,
     refunds: Number(refunds.total),
     due_to_sellers: Number(due.amount),
@@ -468,7 +472,7 @@ router.get('/settings', adminOnly, async (_req, res) => {
   ok(res, await query(`SELECT setting_key, setting_value, description FROM platform_settings ORDER BY setting_key`));
 });
 
-const RATE_KEYS = { platform_fee_rate: [0, 50], deposit_rate: [1, 100], half_payment_rate: [1, 99], refund_fee_rate: [0, 50], payout_delay_days: [0, 60], auto_payouts: [0, 1] };
+const RATE_KEYS = { platform_fee_rate: [0, 50], deposit_rate: [1, 100], half_payment_rate: [1, 99], refund_fee_rate: [0, 50], seller_commission_rate: [0, 50], payout_delay_days: [0, 60], auto_payouts: [0, 1] };
 
 router.put('/settings', adminOnly, validate(z.object({ settings: z.record(z.string(), z.coerce.string().max(500)) })), async (req, res) => {
   const s = req.valid.settings;

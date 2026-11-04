@@ -25,6 +25,7 @@ export const SETTINGS = [
   ['platform_fee_rate', '5', 'Frais plateforme (%) ajoutés au prix de chaque produit et versés à la plateforme'],
   ['deposit_rate', '10', 'Acompte (%) payé en ligne pour un paiement à la livraison'],
   ['half_payment_rate', '50', 'Part (%) payée en ligne pour un paiement en deux fois'],
+  ['seller_commission_rate', '5', 'Commission vendeur (%) retenue au reversement sur le prix enregistré du produit (hors livraison)'],
   ['refund_fee_rate', '3', 'Frais de remboursement (%) conservés par la plateforme sur chaque remboursement'],
   ['auto_payouts', '1', 'Reversements automatiques aux vendeurs après livraison via Jèko (1 = oui, 0 = non)'],
   ['payout_delay_days', '0', 'Délai (jours) après livraison avant de reverser le vendeur (0 = immédiat ; ex. 7 pour couvrir les retours)'],

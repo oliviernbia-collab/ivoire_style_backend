@@ -117,6 +117,8 @@ export async function quoteOrder(executor, user, { shopId, address, deliveryMode
   return {
     shop, items, promo, rates,
     subtotal, sellerSubtotal, platformFee: money(subtotal - sellerSubtotal), discount, delivery, ...split,
+    // 5 % du prix vendeur des articles (hors livraison), retenus au reversement ; la boutique officielle en est exemptée
+    sellerCommission: shop.is_official ? 0 : Math.round((sellerSubtotal * rates.sellerCommission) / 100),
   };
 }
 
@@ -145,11 +147,11 @@ export async function createOrderFromCart(user, { shop_id, address_id, delivery_
     const number = orderNumber();
     const [o] = await conn.query(
       `INSERT INTO orders (order_number, user_id, shop_id, status, payment_status, payment_method, payment_plan, delivery_mode,
-         subtotal, discount_total, promotion_id, promo_code, platform_fee, delivery_fee, total_amount, upfront_amount, balance_amount,
+         subtotal, discount_total, promotion_id, promo_code, platform_fee, seller_commission, delivery_fee, total_amount, upfront_amount, balance_amount,
          currency, ship_recipient, ship_phone, ship_city, ship_commune, ship_district, ship_street, ship_instructions, customer_note)
-       VALUES (?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'XOF', ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, 'pending', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'XOF', ?, ?, ?, ?, ?, ?, ?, ?)`,
       [number, user.id, shopId, payment_method, payment_plan, delivery_mode, q.subtotal, q.discount, q.promo?.promotion.id || null,
-        q.promo?.code || null, q.platformFee, q.delivery, q.total, q.upfront, q.balance, address.recipient_name, address.phone,
+        q.promo?.code || null, q.platformFee, q.sellerCommission, q.delivery, q.total, q.upfront, q.balance, address.recipient_name, address.phone,
         address.city, address.commune, address.district, address.street, address.instructions, note || null],
     );
     const orderId = o.insertId;
@@ -359,13 +361,16 @@ export async function creditSellerOnDelivery(conn, orderId) {
     `SELECT o.*, (SELECT COUNT(*) FROM seller_ledger_entries e WHERE e.order_id = o.id AND e.entry_type = 'sale') AS credited
        FROM orders o WHERE o.id = ?`, [orderId]);
   if (!o || o.credited || !o.shop_id) return;
-  const platformNet = money(Number(o.platform_fee) - Number(o.discount_total));
+  // Retenu par la plateforme : frais client (5 %) − remise promo + commission vendeur (5 % du prix du produit)
+  const platformNet = money(Number(o.platform_fee) - Number(o.discount_total) + Number(o.seller_commission));
   await conn.query(
     `INSERT INTO seller_ledger_entries (shop_id, order_id, entry_type, amount, description) VALUES
        (?, ?, 'sale', ?, ?), (?, ?, 'commission', ?, ?)`,
     [o.shop_id, o.id, o.upfront_amount, `Paiement en ligne ${o.order_number}`,
       o.shop_id, o.id, -platformNet,
-      Number(o.discount_total) > 0 ? `Frais plateforme (remise ${o.promo_code} offerte par la plateforme)` : 'Frais plateforme']);
+      Number(o.seller_commission) > 0
+        ? `Frais plateforme et commission vendeur (${money(o.seller_commission)} FCFA)${Number(o.discount_total) > 0 ? ` — remise ${o.promo_code} offerte par la plateforme` : ''}`
+        : Number(o.discount_total) > 0 ? `Frais plateforme (remise ${o.promo_code} offerte par la plateforme)` : 'Frais plateforme']);
   // Reversement automatique au vendeur une fois la livraison enregistrée (si aucun délai de retours n'est fixé)
   conn.afterCommit?.(() => {
     import('./payments.js')

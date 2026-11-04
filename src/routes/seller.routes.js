@@ -283,6 +283,7 @@ router.get('/products/:id', async (req, res) => {
       price: v.seller_price ?? v.price, compare_at_price: v.seller_compare_at_price ?? v.compare_at_price,
     }));
   p.platform_fee_rate = (await pricingRates()).fee;
+  p.seller_commission_rate = (await pricingRates()).sellerCommission;
   ok(res, p);
 });
 
@@ -494,7 +495,7 @@ router.get('/orders', async (req, res) => {
   const [{ total }] = await query(`SELECT COUNT(DISTINCT oi.order_id) AS total FROM order_items oi WHERE ${where.join(' AND ')}`, params);
   const orders = await query(
     `SELECT o.id, o.order_number, o.created_at, o.payment_method, o.payment_status, o.payment_plan, o.delivery_mode,
-            o.delivery_fee, o.total_amount, o.upfront_amount, o.balance_amount, o.balance_paid_at, o.discount_total, o.platform_fee,
+            o.delivery_fee, o.total_amount, o.upfront_amount, o.balance_amount, o.balance_paid_at, o.discount_total, o.platform_fee, o.seller_commission,
             o.ship_recipient, o.ship_phone, o.ship_city, o.ship_commune, o.ship_district, o.ship_street, o.ship_instructions
        FROM orders o WHERE o.id IN (SELECT DISTINCT oi.order_id FROM order_items oi WHERE ${where.join(' AND ')})
       ORDER BY o.created_at DESC LIMIT ? OFFSET ?`, [...params, limit, offset]);
@@ -506,7 +507,8 @@ router.get('/orders', async (req, res) => {
       o.items = items.filter((i) => i.order_id === o.id).map((i) => ({ ...i, next_statuses: SELLER_TRANSITIONS[i.fulfillment_status] || [] }));
       o.shop_total = money(o.items.reduce((s, i) => s + Number(i.line_total), 0));
       // Ce que le vendeur touche : son prix + sa livraison (une partie via la plateforme, le solde en main propre)
-      o.seller_amount = money(o.items.reduce((s, i) => s + Number(i.seller_amount), 0) + Number(o.delivery_fee));
+      // Ce que le vendeur touche net : son prix + sa livraison − commission vendeur (5 % du prix des articles)
+      o.seller_amount = money(o.items.reduce((s, i) => s + Number(i.seller_amount), 0) + Number(o.delivery_fee) - Number(o.seller_commission));
       o.balance_due = Number(o.balance_amount) > 0 && !o.balance_paid_at ? Number(o.balance_amount) : 0;
     }
   }
@@ -584,7 +586,7 @@ router.get('/finances', async (req, res) => {
        FROM seller_payouts WHERE shop_id = ?`, [id]);
   const upcoming = await queryOne(
     // Montant payé en ligne pour les commandes en cours, crédité au vendeur à la livraison (net des frais plateforme)
-    `SELECT COALESCE(SUM(upfront_amount - platform_fee + discount_total), 0) AS amount FROM orders
+    `SELECT COALESCE(SUM(upfront_amount - platform_fee + discount_total - seller_commission), 0) AS amount FROM orders
       WHERE shop_id = ? AND status IN ('confirmed','preparing','ready','shipped','in_delivery')`, [id]);
   const entries = await query(
     `SELECT id, entry_type, amount, description, created_at FROM seller_ledger_entries WHERE shop_id = ? ORDER BY id DESC LIMIT 50`, [id]);
@@ -595,6 +597,7 @@ router.get('/finances', async (req, res) => {
       WHERE shop_id = ? AND balance_amount > 0 AND balance_paid_at IS NULL AND status IN ('confirmed','preparing','ready','shipped','in_delivery')`, [id]);
   ok(res, {
     platform_fee_rate: (await pricingRates()).fee,
+    seller_commission_rate: (await pricingRates()).sellerCommission,
     payout_method: shop.payout_method,
     payout_account: shop.payout_account,
     payout_holder: shop.payout_holder,
