@@ -20,8 +20,12 @@ router.post('/webhooks/jeko', async (req, res) => {
   ok(res, result);
 });
 
-/** Webhooks du mode sandbox : authentifiés par signature HMAC (pas de JWT). */
+/**
+ * Webhooks du mode sandbox : authentifiés par signature HMAC (pas de JWT).
+ * Désactivés hors sandbox : en mode Jèko, seul le webhook Jèko signé peut confirmer un paiement.
+ */
 router.post('/webhooks/:provider', async (req, res) => {
+  if (isJeko()) throw notFound('Ressource introuvable');
   const result = await processWebhook(req.params.provider, req.rawBody, req.headers['x-ivs-signature']);
   ok(res, result);
 });
@@ -109,6 +113,7 @@ router.post('/:id/sandbox', validate(z.object({
   outcome: z.enum(['success', 'failure']),
   payer_phone: z.string().trim().regex(/^\+?[0-9 ]{8,20}$/, 'Numéro Mobile Money invalide').optional(),
 })), async (req, res) => {
+  if (isJeko()) throw notFound('Ressource introuvable');
   const p = await ownPayment(req);
   if (!['initiated', 'pending'].includes(p.status)) throw badRequest('Ce paiement est déjà traité');
   const result = await simulateProviderCallback(p.id, req.valid.outcome);

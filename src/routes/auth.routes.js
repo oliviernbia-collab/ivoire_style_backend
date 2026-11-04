@@ -16,13 +16,21 @@ import { audit, roleId } from '../services/common.js';
 
 const router = Router();
 
+const tooMany = { success: false, message: 'Trop de tentatives. Réessayez dans quelques minutes.' };
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
-  message: { success: false, message: 'Trop de tentatives. Réessayez dans quelques minutes.' },
+  message: tooMany,
 });
+// Inscription, mot de passe oublié, réinitialisation : limite stricte par adresse IP (création de comptes en masse,
+// envoi de liens, essais de jetons)
+const sensitiveLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: true, legacyHeaders: false, message: tooMany });
+const refreshLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 120, standardHeaders: true, legacyHeaders: false, message: tooMany });
+
+// Empreinte factice : un identifiant inconnu prend le même temps qu'un mauvais mot de passe (pas d'énumération des comptes)
+const DUMMY_HASH = bcrypt.hashSync('compte-inexistant-ivoire-style', 12);
 
 const phoneRegex = /^\+?[0-9 ]{8,20}$/;
 const password = z.string().min(8, 'Au moins 8 caractères')
@@ -37,7 +45,7 @@ const registerSchema = z.object({
 });
 
 async function issueTokens(userId, req) {
-  const access_token = jwt.sign({ sub: userId }, env.jwt.accessSecret, { expiresIn: env.jwt.accessExpires });
+  const access_token = jwt.sign({ sub: userId }, env.jwt.accessSecret, { expiresIn: env.jwt.accessExpires, algorithm: 'HS256' });
   const refresh_token = crypto.randomBytes(48).toString('hex');
   await query(
     `INSERT INTO refresh_tokens (user_id, token_hash, expires_at, user_agent)
@@ -47,7 +55,7 @@ async function issueTokens(userId, req) {
   return { access_token, refresh_token };
 }
 
-router.post('/register', validate(registerSchema), async (req, res) => {
+router.post('/register', sensitiveLimiter, validate(registerSchema), async (req, res) => {
   const d = req.valid;
   const phone = d.phone.replace(/\s+/g, '');
   const exists = await queryOne(`SELECT email, phone FROM users WHERE email = ? OR phone = ?`, [d.email, phone]);
@@ -86,7 +94,10 @@ router.post('/login', loginLimiter, validate(loginSchema), async (req, res) => {
     [ident, ident],
   );
   const invalid = unauthorized('Identifiants incorrects');
-  if (!user) throw invalid;
+  if (!user) {
+    await bcrypt.compare(pwd, DUMMY_HASH);
+    throw invalid;
+  }
   if (user.locked_until && new Date(user.locked_until) > new Date()) {
     throw unauthorized('Compte temporairement verrouillé après plusieurs échecs. Réessayez dans 15 minutes.');
   }
@@ -106,14 +117,19 @@ router.post('/login', loginLimiter, validate(loginSchema), async (req, res) => {
   ok(res, { user: await loadUser(user.id), ...tokens }, 'Connexion réussie');
 });
 
-router.post('/refresh', async (req, res) => {
+router.post('/refresh', refreshLimiter, async (req, res) => {
   const token = req.body?.refresh_token;
-  if (!token) throw unauthorized('Jeton manquant');
-  const row = await queryOne(
-    `SELECT id, user_id FROM refresh_tokens WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > NOW()`,
-    [sha256(token)],
-  );
-  if (!row) throw unauthorized('Session expirée, veuillez vous reconnecter');
+  if (!token || typeof token !== 'string') throw unauthorized('Jeton manquant');
+  const row = await queryOne(`SELECT id, user_id, revoked_at, expires_at FROM refresh_tokens WHERE token_hash = ?`, [sha256(token)]);
+  // Jeton déjà utilisé : il a été copié (vol de session). Toutes les sessions de ce compte sont fermées.
+  // Tolérance de 30 s : deux onglets qui renouvellent la session au même moment ne sont pas un vol.
+  if (row?.revoked_at && Date.now() - new Date(row.revoked_at).getTime() < 30_000) throw unauthorized('Session renouvelée, réessayez');
+  if (row?.revoked_at) {
+    await query(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL`, [row.user_id]);
+    await audit({ ip: req.ip, user: { id: row.user_id } }, 'auth.refresh_reuse', 'user', row.user_id);
+    throw unauthorized('Session expirée, veuillez vous reconnecter');
+  }
+  if (!row || new Date(row.expires_at) <= new Date()) throw unauthorized('Session expirée, veuillez vous reconnecter');
   await query(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE id = ?`, [row.id]);
   const user = await loadUser(row.user_id);
   if (!user || user.status !== 'active') throw unauthorized('Compte inactif');
@@ -127,7 +143,7 @@ router.post('/logout', async (req, res) => {
   ok(res, null, 'Vous êtes déconnecté');
 });
 
-router.post('/forgot-password', validate(z.object({ email: z.string().trim().toLowerCase().email('E-mail invalide') })), async (req, res) => {
+router.post('/forgot-password', sensitiveLimiter, validate(z.object({ email: z.string().trim().toLowerCase().email('E-mail invalide') })), async (req, res) => {
   const user = await queryOne(`SELECT id FROM users WHERE email = ? AND status = 'active'`, [req.valid.email]);
   const data = {};
   if (user) {
@@ -138,13 +154,17 @@ router.post('/forgot-password', validate(z.object({ email: z.string().trim().toL
     );
     const link = `${env.webUrl}/reinitialiser-mot-de-passe?token=${token}`;
     // Point d'extension : envoi par e-mail transactionnel.
-    console.log(`[RESET] Lien de réinitialisation pour ${req.valid.email} : ${link}`);
-    if (env.nodeEnv !== 'production') data.dev_reset_link = link;
+    // Le lien donne accès au compte : jamais dans les journaux ni la réponse en production.
+    if (env.nodeEnv !== 'production') {
+      console.log(`[RESET] Lien de réinitialisation pour ${req.valid.email} : ${link}`);
+      data.dev_reset_link = link;
+    }
+    await audit({ ip: req.ip, user: { id: user.id } }, 'auth.password_reset_requested', 'user', user.id);
   }
   ok(res, data, 'Si un compte existe pour cet e-mail, un lien de réinitialisation a été envoyé.');
 });
 
-router.post('/reset-password', validate(z.object({ token: z.string().min(10), password })), async (req, res) => {
+router.post('/reset-password', sensitiveLimiter, validate(z.object({ token: z.string().min(10).max(200), password })), async (req, res) => {
   const row = await queryOne(
     `SELECT id, user_id FROM password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW()`,
     [sha256(req.valid.token)],
@@ -156,6 +176,7 @@ router.post('/reset-password', validate(z.object({ token: z.string().min(10), pa
     await conn.query(`UPDATE password_resets SET used_at = NOW() WHERE id = ?`, [row.id]);
     await conn.query(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL`, [row.user_id]);
   });
+  await audit({ ip: req.ip, user: { id: row.user_id } }, 'auth.password_reset', 'user', row.user_id);
   ok(res, null, 'Mot de passe modifié. Vous pouvez vous connecter.');
 });
 
@@ -183,6 +204,25 @@ router.patch('/me', requireAuth, upload.single('avatar'), validate(profileSchema
   ok(res, await loadUser(req.user.id), 'Profil mis à jour');
 });
 
+/** Photo de profil : envoyée seule (JPG, PNG ou WEBP, 5 Mo max, contenu vérifié), stockée sur Cloudinary. */
+router.put('/me/avatar', requireAuth, upload.single('avatar'), (req, _res, next) => {
+  if (!req.file) throw badRequest('Choisissez une photo', { avatar: 'Photo requise' });
+  next();
+}, toCloud({ avatar: 'avatars' }), async (req, res) => {
+  await query(`UPDATE users SET avatar_url = ? WHERE id = ?`, [publicFileUrl(req.file), req.user.id]);
+  // L'ancienne photo est supprimée de Cloudinary
+  if (req.user.avatar_url) await destroyByUrl(req.user.avatar_url);
+  ok(res, await loadUser(req.user.id), 'Photo de profil mise à jour');
+});
+
+router.delete('/me/avatar', requireAuth, async (req, res) => {
+  if (req.user.avatar_url) {
+    await query(`UPDATE users SET avatar_url = NULL WHERE id = ?`, [req.user.id]);
+    await destroyByUrl(req.user.avatar_url);
+  }
+  ok(res, await loadUser(req.user.id), 'Photo de profil retirée');
+});
+
 router.post('/change-password', requireAuth,
   validate(z.object({ current_password: z.string().min(1, 'Mot de passe actuel requis'), new_password: password })),
   async (req, res) => {
@@ -191,7 +231,10 @@ router.post('/change-password', requireAuth,
       throw badRequest('Mot de passe actuel incorrect', { current_password: 'Mot de passe actuel incorrect' });
     }
     await query(`UPDATE users SET password_hash = ? WHERE id = ?`, [await bcrypt.hash(req.valid.new_password, 12), req.user.id]);
-    ok(res, null, 'Mot de passe modifié avec succès');
+    // Toutes les autres sessions (autres appareils, session volée) sont fermées ; celle-ci reçoit de nouveaux jetons
+    await query(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE user_id = ? AND revoked_at IS NULL`, [req.user.id]);
+    await audit(req, 'auth.password_changed', 'user', req.user.id);
+    ok(res, await issueTokens(req.user.id, req), 'Mot de passe modifié. Vos autres appareils ont été déconnectés.');
   });
 
 /** Demande de suppression : anonymisation (les commandes sont conservées pour les obligations comptables). */

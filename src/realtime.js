@@ -30,7 +30,7 @@ export function initRealtime(httpServer) {
   // Authentification par le jeton d'accès (le même que pour l'API)
   io.use(async (socket, next) => {
     try {
-      const payload = jwt.verify(String(socket.handshake.auth?.token || ''), env.jwt.accessSecret);
+      const payload = jwt.verify(String(socket.handshake.auth?.token || ''), env.jwt.accessSecret, { algorithms: ['HS256'] });
       const user = await loadUser(payload.sub);
       if (!user || user.status !== 'active') return next(new Error('unauthorized'));
       socket.data.user = user;

@@ -40,6 +40,19 @@ const env = {
   },
 };
 
+// Production : refus de démarrer avec des secrets faibles ou par défaut, ou des adresses non chiffrées
+if (env.nodeEnv === 'production') {
+  const problems = [];
+  const weak = (v) => !v || v.length < 32 || /change_me|dev_|secret_change/i.test(v);
+  if (weak(process.env.JWT_ACCESS_SECRET)) problems.push('JWT_ACCESS_SECRET (64 caractères aléatoires recommandés)');
+  if (env.payment.mode === 'sandbox' || weak(process.env.PAYMENT_WEBHOOK_SECRET)) problems.push('PAYMENT_WEBHOOK_SECRET');
+  if (!env.db.password) problems.push('DB_PASSWORD (utilisateur MySQL avec mot de passe)');
+  if (env.db.user === 'root') problems.push('DB_USER (n’utilisez pas root : créez un utilisateur limité à db_style)');
+  if (!/^https:\/\//.test(env.webUrl)) problems.push('WEB_URL (adresse HTTPS du site)');
+  if (env.corsOrigins.some((o) => !/^https:\/\//.test(o))) problems.push('CORS_ORIGINS (uniquement des adresses HTTPS)');
+  if (problems.length) throw new Error(`Configuration de production non sécurisée : ${problems.join(' ; ')}`);
+}
+
 if (!['sandbox', 'jeko'].includes(env.payment.mode)) {
   throw new Error('PAYMENT_MODE doit valoir « sandbox » ou « jeko »');
 }

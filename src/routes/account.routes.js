@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { query, queryOne, transaction } from '../config/db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
-import { notFound, ok, created } from '../utils/http.js';
+import { notFound, ok, created, pageMeta } from '../utils/http.js';
 import { userPromotions } from '../services/promotions.js';
 
 const router = Router();
@@ -66,12 +66,59 @@ router.delete('/addresses/:id', async (req, res) => {
 router.get('/promotions', async (req, res) => ok(res, await userPromotions(req.user.id)));
 
 // ---------------- Notifications ----------------
-router.get('/notifications', async (req, res) => {
+// Catégories de notifications affichées au client, au vendeur et à l'administration
+const NOTIF_CATEGORIES = {
+  orders: ['order', 'seller_order', 'return'],
+  payments: ['payment'],
+  refunds: ['refund'],
+  payouts: ['payout'],
+  shop: ['seller', 'seller_request', 'moderation'],
+  promotions: ['promotion'],
+};
+const KNOWN_TYPES = Object.values(NOTIF_CATEGORIES).flat();
+const categoryOf = (type) => Object.keys(NOTIF_CATEGORIES).find((k) => NOTIF_CATEGORIES[k].includes(type)) || 'other';
+
+/**
+ * Notifications filtrées : catégorie, lues / non lues, période (from / to, AAAA-MM-JJ) et recherche (q).
+ * Renvoie aussi le nombre total de non lues (pastille) et le nombre par catégorie pour les filtres.
+ */
+router.get('/notifications', validate(z.object({
+  category: z.enum([...Object.keys(NOTIF_CATEGORIES), 'other']).optional().catch(undefined),
+  status: z.enum(['unread', 'read']).optional().catch(undefined),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().catch(undefined),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().catch(undefined),
+  q: z.string().trim().max(80).optional(),
+  page: z.coerce.number().int().min(1).default(1).catch(1),
+}), 'query'), async (req, res) => {
+  const f = req.valid;
+  const limit = 20;
+  // Filtres communs (hors catégorie) : servent aussi au décompte par catégorie
+  const where = ['user_id = ?'];
+  const params = [req.user.id];
+  if (f.status === 'unread') where.push('read_at IS NULL');
+  if (f.status === 'read') where.push('read_at IS NOT NULL');
+  if (f.from) { where.push('created_at >= ?'); params.push(`${f.from} 00:00:00`); }
+  if (f.to) { where.push('created_at <= ?'); params.push(`${f.to} 23:59:59`); }
+  if (f.q) { where.push('(title LIKE ? OR body LIKE ?)'); params.push(`%${f.q}%`, `%${f.q}%`); }
+
+  const byType = await query(`SELECT type, COUNT(*) AS n FROM notifications WHERE ${where.join(' AND ')} GROUP BY type`, params);
+  const counts = { all: 0, ...Object.fromEntries([...Object.keys(NOTIF_CATEGORIES), 'other'].map((k) => [k, 0])) };
+  byType.forEach((t) => { counts[categoryOf(t.type)] += t.n; counts.all += t.n; });
+
+  if (f.category === 'other') {
+    where.push(`type NOT IN (${KNOWN_TYPES.map(() => '?').join(',')})`);
+    params.push(...KNOWN_TYPES);
+  } else if (f.category) {
+    where.push(`type IN (${NOTIF_CATEGORIES[f.category].map(() => '?').join(',')})`);
+    params.push(...NOTIF_CATEGORIES[f.category]);
+  }
+  const [{ total }] = await query(`SELECT COUNT(*) AS total FROM notifications WHERE ${where.join(' AND ')}`, params);
   const items = await query(
     `SELECT id, type, title, body, link, read_at, created_at FROM notifications
-      WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`, [req.user.id]);
+      WHERE ${where.join(' AND ')} ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`, [...params, limit, (f.page - 1) * limit]);
+  items.forEach((n) => { n.category = categoryOf(n.type); });
   const [{ unread }] = await query(`SELECT COUNT(*) AS unread FROM notifications WHERE user_id = ? AND read_at IS NULL`, [req.user.id]);
-  ok(res, { items, unread });
+  ok(res, { items, unread, counts }, null, pageMeta(f.page, limit, total));
 });
 
 router.post('/notifications/read-all', async (req, res) => {

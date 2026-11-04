@@ -34,7 +34,7 @@ export async function requireAuth(req, _res, next) {
   if (!token) throw unauthorized();
   let payload;
   try {
-    payload = jwt.verify(token, env.jwt.accessSecret);
+    payload = jwt.verify(token, env.jwt.accessSecret, { algorithms: ['HS256'] });
   } catch {
     throw unauthorized('Session expirée, veuillez vous reconnecter');
   }
@@ -48,7 +48,7 @@ export async function optionalAuth(req, _res, next) {
   const token = readToken(req);
   if (token) {
     try {
-      const payload = jwt.verify(token, env.jwt.accessSecret);
+      const payload = jwt.verify(token, env.jwt.accessSecret, { algorithms: ['HS256'] });
       const user = await loadUser(payload.sub);
       if (user && user.status === 'active') req.user = user;
     } catch {

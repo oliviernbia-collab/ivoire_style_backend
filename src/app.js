@@ -33,10 +33,22 @@ app.use(cors({
 }));
 // rawBody conservé pour la vérification de signature des webhooks
 app.use(express.json({ limit: '1mb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
-app.use(express.urlencoded({ extended: true }));
-if (env.nodeEnv !== 'test') app.use(morgan('dev'));
+app.use(express.urlencoded({ extended: true, limit: '100kb', parameterLimit: 200 }));
+if (env.nodeEnv !== 'test') app.use(morgan(env.nodeEnv === 'production' ? 'combined' : 'dev'));
 
-app.use('/api', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false }));
+// Réponses liées à un compte (profil, commandes, paiements…) : jamais conservées en cache (navigateur, proxy)
+app.use('/api', (req, res, next) => {
+  if (req.headers.authorization) res.set('Cache-Control', 'no-store');
+  next();
+});
+
+const tooMany = { success: false, message: 'Trop de requêtes. Patientez un instant avant de réessayer.' };
+app.use('/api', rateLimit({ windowMs: 60_000, limit: 300, standardHeaders: true, legacyHeaders: false, message: tooMany }));
+// Argent : création de commandes, demandes de paiement Jèko, annulations / remboursements (par adresse IP)
+app.use(['/api/v1/orders', '/api/v1/payments/initiate'], rateLimit({
+  windowMs: 60_000, limit: 20, standardHeaders: true, legacyHeaders: false, message: tooMany,
+  skip: (req) => req.method === 'GET' || req.path === '/quote', // le devis est recalculé à chaque choix du client
+}));
 
 // Aucun fichier n'est servi par l'API : images, vidéos et documents sont stockés sur Cloudinary.
 
