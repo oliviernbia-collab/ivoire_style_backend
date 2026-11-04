@@ -140,6 +140,39 @@ try {
     changes++;
   }
 
+  // Jèko : numéro réellement débité (remboursement au bon compte) et transaction, distincte de la demande de paiement
+  await addColumn('payments', 'payer_account', 'VARCHAR(40) NULL AFTER payer_phone');
+  await addColumn('payments', 'provider_transaction_id', 'VARCHAR(120) NULL AFTER provider_reference');
+
+  // Frais de remboursement : part de la somme remboursée conservée par la plateforme
+  await addColumn('refunds', 'fee_amount', 'DECIMAL(12,2) NOT NULL DEFAULT 0 AFTER amount');
+  const [rf] = await conn.query(`INSERT IGNORE INTO platform_settings (setting_key, setting_value, description) VALUES (?, ?, ?)`,
+    ['refund_fee_rate', '3', 'Frais de remboursement (%) conservés par la plateforme sur chaque remboursement']);
+  if (rf.affectedRows) { console.log('✔ Paramètre refund_fee_rate = 3'); changes++; }
+
+  // Reversements automatiques aux vendeurs après livraison
+  for (const [k, v, d] of [
+    ['auto_payouts', '1', 'Reversements automatiques aux vendeurs après livraison via Jèko (1 = oui, 0 = non)'],
+    ['payout_delay_days', '0', 'Délai (jours) après livraison avant de reverser le vendeur (0 = immédiat ; ex. 7 pour couvrir les retours)'],
+  ]) {
+    const [r] = await conn.query(`INSERT IGNORE INTO platform_settings (setting_key, setting_value, description) VALUES (?, ?, ?)`, [k, v, d]);
+    if (r.affectedRows) { console.log(`✔ Paramètre ${k} = ${v}`); changes++; }
+  }
+
+  // Tarifs de livraison du vendeur par commune d'Abidjan et par ville (sinon tarifs par défaut de la boutique)
+  await createTable('shop_delivery_zones', `CREATE TABLE shop_delivery_zones (
+    id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    shop_id    INT UNSIGNED NOT NULL,
+    zone_type  ENUM('commune','city') NOT NULL,
+    name       VARCHAR(80) NOT NULL,
+    name_key   VARCHAR(80) NOT NULL,
+    fee        DECIMAL(12,2) NULL,
+    delivers   TINYINT(1) NOT NULL DEFAULT 1,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_sdz_zone (shop_id, zone_type, name_key),
+    CONSTRAINT fk_sdz_shop FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+
   console.log(changes ? `✔ Migration terminée (${changes} modification(s))` : '✔ Base déjà à jour');
 } finally {
   conn.release();

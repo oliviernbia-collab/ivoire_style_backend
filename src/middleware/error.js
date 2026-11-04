@@ -25,6 +25,11 @@ export function errorHandler(err, req, res, _next) {
   if (err?.type === 'entity.parse.failed') {
     return res.status(400).json({ success: false, message: 'JSON invalide' });
   }
+  // MySQL arrêté ou redémarré (XAMPP) : message clair et une seule ligne de journal, sans pile d'appels
+  if (['ECONNREFUSED', 'ECONNRESET', 'PROTOCOL_CONNECTION_LOST', 'ETIMEDOUT'].includes(err?.code)) {
+    console.error(`[BASE DE DONNÉES] ${err.code} sur ${req.method} ${req.originalUrl} : MySQL est-il démarré (XAMPP) ?`);
+    return res.status(503).json({ success: false, message: 'Service momentanément indisponible. Réessayez dans un instant.' });
+  }
   console.error('[ERREUR]', req.method, req.originalUrl, err);
   res.status(500).json({ success: false, message: 'Une erreur interne est survenue. Réessayez plus tard.' });
 }

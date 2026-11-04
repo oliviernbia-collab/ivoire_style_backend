@@ -95,6 +95,12 @@ export function createTransfer({ amount, reference, method, phone, name, descrip
   });
 }
 
+/** Solde disponible du magasin, en centimes (reçoit les encaissements, finance remboursements et reversements). */
+export async function getStoreBalance() {
+  const b = await call('GET', `/partner_api/stores/${encodeURIComponent(env.jeko.storeId)}/balance`);
+  return Number(b?.amount ?? 0);
+}
+
 export const getTransfer = (id) => call('GET', `/partner_api/transfers/${encodeURIComponent(id)}`);
 
 /** En-tête Jeko-Signature : HMAC-SHA256 hexadécimal du corps brut, comparé en temps constant. */

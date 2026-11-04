@@ -13,7 +13,7 @@ import { refreshMinPrice } from '../services/catalog.js';
 import {
   creditSellerOnDelivery, markBalanceCollected, ORDER_STATUS_LABELS, recomputeOrderStatus, SELLER_TRANSITIONS,
 } from '../services/orders.js';
-import { pricingRates, withFee } from '../services/pricing.js';
+import { isAbidjan, pricingRates, withFee, zoneKey } from '../services/pricing.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -149,6 +149,48 @@ router.patch('/shop',
     if (req.files?.banner?.[0]) await destroyByUrl(before.banner_url);
     ok(res, await queryOne(`SELECT * FROM shops WHERE id = ?`, [req.shopId]), 'Boutique mise à jour');
   });
+
+// =====================================================================
+// Tarifs de livraison par commune d'Abidjan et par ville
+// =====================================================================
+router.get('/delivery-zones', async (req, res) => {
+  const zones = await query(
+    `SELECT zone_type, name, fee, delivers FROM shop_delivery_zones WHERE shop_id = ? ORDER BY zone_type, name`, [req.shopId]);
+  ok(res, zones.map((z) => ({ ...z, fee: z.fee == null ? null : Number(z.fee), delivers: Boolean(z.delivers) })));
+});
+
+/** Remplace l'ensemble des tarifs par zone (fee vide = tarif par défaut ; delivers faux = zone non desservie). */
+router.put('/delivery-zones', validate(z.object({
+  zones: z.array(z.object({
+    zone_type: z.enum(['commune', 'city']),
+    name: z.string().trim().min(2, 'Nom de zone requis').max(80),
+    fee: z.preprocess((v) => (v === '' || v === undefined ? null : v), z.coerce.number().min(0, 'Montant invalide').max(1_000_000).nullable()),
+    delivers: z.coerce.boolean().default(true),
+  })).max(300, '300 zones maximum'),
+})), async (req, res) => {
+  // Seules les zones utiles sont gardées : un tarif propre, ou « je ne livre pas »
+  const seen = new Set();
+  const zones = req.valid.zones.filter((zn) => zn.fee != null || !zn.delivers).filter((zn) => {
+    const key = `${zn.zone_type}:${zoneKey(zn.name)}`;
+    if (!zoneKey(zn.name) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  // Ville « Abidjan » : ses tarifs se règlent commune par commune
+  if (zones.some((zn) => zn.zone_type === 'city' && isAbidjan(zn.name))) {
+    throw badRequest('Pour Abidjan, indiquez les tarifs commune par commune', { zones: 'Abidjan se règle par commune' });
+  }
+  await transaction(async (conn) => {
+    await conn.query(`DELETE FROM shop_delivery_zones WHERE shop_id = ?`, [req.shopId]);
+    for (const zn of zones) {
+      await conn.query(
+        `INSERT INTO shop_delivery_zones (shop_id, zone_type, name, name_key, fee, delivers) VALUES (?, ?, ?, ?, ?, ?)`,
+        [req.shopId, zn.zone_type, zn.name, zoneKey(zn.name), zn.fee, zn.delivers ? 1 : 0]);
+    }
+  });
+  await audit(req, 'shop.delivery_zones', 'shop', req.shopId, { count: zones.length });
+  ok(res, zones, zones.length ? `Tarifs de livraison enregistrés (${zones.length} zone(s))` : 'Tarifs par zone retirés : vos tarifs par défaut s’appliquent');
+});
 
 router.get('/dashboard', async (req, res) => {
   const id = req.shopId;

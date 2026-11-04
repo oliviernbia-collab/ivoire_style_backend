@@ -14,7 +14,10 @@ import {
 import { refreshRating } from '../services/catalog.js';
 import { grantSellerRole } from './seller.routes.js';
 import { clientAudience, sellerAudience } from '../services/promotions.js';
-import { autoRefund, refundMessage, requestRefund, sendPayout, setPayoutStatus } from '../services/payments.js';
+import {
+  autoRefund, createPayout, refundMessage, requestRefund, sendPayout, setPayoutStatus,
+} from '../services/payments.js';
+import { jekoPhone } from '../services/jeko.js';
 
 const router = Router();
 router.use(requireAuth, requireRole('admin', 'support'));
@@ -44,7 +47,7 @@ router.get('/dashboard', adminOnly, async (_req, res) => {
         AND (p.ends_at IS NULL OR p.ends_at >= NOW())`);
   const commissions = await queryOne(
     `SELECT COALESCE(SUM(commission_amount), 0) AS total FROM order_items WHERE fulfillment_status NOT IN ('pending','cancelled','refunded')`);
-  const refunds = await queryOne(`SELECT COALESCE(SUM(amount), 0) AS total FROM refunds WHERE status = 'succeeded'`);
+  const refunds = await queryOne(`SELECT COALESCE(SUM(amount), 0) AS total, COALESCE(SUM(fee_amount), 0) AS fees FROM refunds WHERE status = 'succeeded'`);
   const due = await queryOne(`SELECT
       (SELECT COALESCE(SUM(amount), 0) FROM seller_ledger_entries) -
       (SELECT COALESCE(SUM(amount), 0) FROM seller_payouts WHERE status IN ('paid','pending')) AS amount`);
@@ -63,7 +66,9 @@ router.get('/dashboard', adminOnly, async (_req, res) => {
     platform_revenue: Number(commissions.total),
     // Remises des codes promo, prises en charge par la plateforme (revenu net = commissions - remises)
     promo_discounts: Number(money1.discounts),
-    net_revenue: money(Number(commissions.total) - Number(money1.discounts)),
+    // Frais de remboursement (3 %) conservés par la plateforme lors des annulations
+    refund_fees: Number(refunds.fees),
+    net_revenue: money(Number(commissions.total) + Number(refunds.fees) - Number(money1.discounts)),
     active_promotions: activePromos.n,
     refunds: Number(refunds.total),
     due_to_sellers: Number(due.amount),
@@ -295,14 +300,24 @@ router.post('/orders/:id/cancel', adminOnly, validate(z.object({ reason: z.strin
 router.post('/orders/:id/refund', adminOnly, validate(z.object({
   amount: z.coerce.number().positive('Montant invalide').optional(),
   reason: z.string().trim().min(3, 'Motif requis').max(255),
+  refund_phone: z.string().trim().max(30).optional(),
 })), async (req, res) => {
+  // Numéro de remboursement corrigé par l'administration (ex. numéro saisi par erreur au paiement)
+  if (req.valid.refund_phone) {
+    const phone = jekoPhone(req.valid.refund_phone);
+    if (!phone) throw badRequest('Numéro de remboursement invalide', { refund_phone: 'Numéro ivoirien à 10 chiffres' });
+    await query(`UPDATE payments SET payer_account = ? WHERE order_id = ? AND status IN ('succeeded','refunding','partially_refunded')`,
+      [phone, Number(req.params.id)]);
+  }
   const result = await requestRefund(Number(req.params.id), req.valid, req.user.id);
   await audit(req, 'order.refund', 'order', req.params.id, result);
   const message = result.status === 'succeeded'
     ? `Remboursement de ${result.amount} FCFA effectué`
     : result.status === 'processing'
       ? `Virement de ${result.amount} FCFA envoyé au client : en attente de confirmation de l’opérateur`
-      : 'Le virement de remboursement a échoué';
+      : result.status === 'waiting'
+        ? `Solde Jèko insuffisant : le remboursement de ${result.amount} FCFA partira automatiquement dès que le solde le permettra`
+        : 'Le virement de remboursement a échoué';
   ok(res, await loadOrderDetail(req.params.id), message);
 });
 router.patch('/orders/:id/status', adminOnly, validate(z.object({
@@ -387,20 +402,10 @@ router.post('/payouts', adminOnly, validate(z.object({
   note: z.string().trim().max(255).optional(),
 })), async (req, res) => {
   const { shop_id, amount, note } = req.valid;
-  const ref = await transaction(async (conn) => {
-    const [[shop]] = await conn.query(`SELECT * FROM shops WHERE id = ? FOR UPDATE`, [shop_id]);
-    if (!shop) throw notFound('Boutique introuvable');
-    const [[{ earned }]] = await conn.query(`SELECT COALESCE(SUM(amount), 0) AS earned FROM seller_ledger_entries WHERE shop_id = ?`, [shop_id]);
-    const [[{ out }]] = await conn.query(`SELECT COALESCE(SUM(amount), 0) AS \`out\` FROM seller_payouts WHERE shop_id = ? AND status IN ('paid','pending')`, [shop_id]);
-    const balance = money(Number(earned) - Number(out));
-    if (amount > balance) throw badRequest(`Montant supérieur au solde disponible (${balance} FCFA)`);
-    const reference = `PO-${randomCode(10)}`;
-    await conn.query(`INSERT INTO seller_payouts (shop_id, reference, amount, method, status, note, created_by) VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
-      [shop_id, reference, amount, shop.payout_method, note || null, req.user.id]);
-    return reference;
-  });
+  // Reversement manuel (ex. compte bancaire, ou reversement anticipé) : même contrôle de solde que l'automatique
+  const payout = await createPayout(shop_id, amount, note, req.user.id);
+  const ref = payout.reference;
   await audit(req, 'payout.create', 'shop', shop_id, { amount, ref });
-  const payout = await queryOne(`SELECT id FROM seller_payouts WHERE reference = ?`, [ref]);
   // Mode Jèko : virement immédiat sur le compte Mobile Money du vendeur ; sinon paiement manuel puis « payé »
   const sent = await sendPayout(payout.id, req.user.id);
   created(res, { reference: ref, status: sent.status, manual: Boolean(sent.manual) },
@@ -463,7 +468,7 @@ router.get('/settings', adminOnly, async (_req, res) => {
   ok(res, await query(`SELECT setting_key, setting_value, description FROM platform_settings ORDER BY setting_key`));
 });
 
-const RATE_KEYS = { platform_fee_rate: [0, 50], deposit_rate: [1, 100], half_payment_rate: [1, 99] };
+const RATE_KEYS = { platform_fee_rate: [0, 50], deposit_rate: [1, 100], half_payment_rate: [1, 99], refund_fee_rate: [0, 50], payout_delay_days: [0, 60], auto_payouts: [0, 1] };
 
 router.put('/settings', adminOnly, validate(z.object({ settings: z.record(z.string(), z.coerce.string().max(500)) })), async (req, res) => {
   const s = req.valid.settings;

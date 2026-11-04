@@ -4,7 +4,7 @@ import { badRequest, notFound } from '../utils/http.js';
 import { money, orderNumber, price as fmtPrice, randomCode } from '../utils/helpers.js';
 import { getSettings, notify } from './common.js';
 import { resolveClientPromo } from './promotions.js';
-import { deliveryFee, PAYMENT_PLANS, paymentSplit, pricingRates } from './pricing.js';
+import { deliveryFee, loadDeliveryZones, PAYMENT_PLANS, paymentSplit, pricingRates, refundSplit } from './pricing.js';
 
 export const ORDER_STATUS_LABELS = {
   pending: 'En attente de paiement',
@@ -94,7 +94,7 @@ export async function resolveShopId(userId, shopId) {
  * Devis d'une commande (sans écriture) : sous-total, frais plateforme, remise, livraison du vendeur,
  * total, part payée en ligne et solde à la livraison.
  */
-export async function quoteOrder(executor, user, { shopId, city, deliveryMode, plan, promoCode, lock = false }) {
+export async function quoteOrder(executor, user, { shopId, address, deliveryMode, plan, promoCode, lock = false }) {
   const [[shop]] = await executor.query(`SELECT * FROM shops WHERE id = ?`, [shopId]);
   if (!shop) throw notFound('Boutique introuvable');
   const items = await cartLinesForShop(executor, user.id, shopId, lock);
@@ -107,7 +107,8 @@ export async function quoteOrder(executor, user, { shopId, city, deliveryMode, p
     subtotal = money(subtotal + it.line_total);
     sellerSubtotal = money(sellerSubtotal + it.seller_line);
   }
-  const delivery = deliveryFee(shop, city, deliveryMode, subtotal);
+  const zones = await loadDeliveryZones(executor, shopId);
+  const delivery = deliveryFee(shop, { city: address.city, commune: address.commune }, deliveryMode, subtotal, zones);
   if (delivery === null) throw badRequest('Mode de livraison non proposé par cette boutique', { delivery_mode: 'Indisponible' });
   const promo = await resolveClientPromo(lock ? executor : null, user.id, promoCode, subtotal);
   const discount = promo?.discount || 0;
@@ -128,7 +129,7 @@ export async function createOrderFromCart(user, { shop_id, address_id, delivery_
 
   return transaction(async (conn) => {
     const q = await quoteOrder(conn, user, {
-      shopId, city: address.city, deliveryMode: delivery_mode, plan: payment_plan, promoCode: promo_code, lock: true,
+      shopId, address, deliveryMode: delivery_mode, plan: payment_plan, promoCode: promo_code, lock: true,
     });
     if (q.shop.status !== 'approved') throw badRequest('Cette boutique n’accepte pas de commande pour le moment');
     for (const it of q.items) {
@@ -307,7 +308,9 @@ export async function cancelOrder(orderId, actor, reason, { force = false } = {}
     await notify(order.user_id, {
       type: 'order',
       title: `Commande ${order.order_number} annulée`,
-      body: paid ? 'Le montant payé en ligne vous sera remboursé.' : 'Votre commande a été annulée.',
+      body: paid
+        ? `Le montant payé en ligne vous sera remboursé automatiquement, moins ${(await pricingRates()).refundFee} % de frais de remboursement.`
+        : 'Votre commande a été annulée.',
       link: `/compte/commandes/${orderId}`,
     }, conn);
     // Le vendeur est prévenu, sauf si la commande n'avait jamais été payée (il ne l'a donc jamais reçue)
@@ -363,6 +366,12 @@ export async function creditSellerOnDelivery(conn, orderId) {
     [o.shop_id, o.id, o.upfront_amount, `Paiement en ligne ${o.order_number}`,
       o.shop_id, o.id, -platformNet,
       Number(o.discount_total) > 0 ? `Frais plateforme (remise ${o.promo_code} offerte par la plateforme)` : 'Frais plateforme']);
+  // Reversement automatique au vendeur une fois la livraison enregistrée (si aucun délai de retours n'est fixé)
+  conn.afterCommit?.(() => {
+    import('./payments.js')
+      .then((m) => m.autoPayoutShop(o.shop_id))
+      .catch((e) => console.error('[REVERSEMENT AUTO]', o.order_number, e.message));
+  });
 }
 
 export async function loadOrderDetail(orderId) {
@@ -383,6 +392,17 @@ export async function loadOrderDetail(orderId) {
     `SELECT id, provider, reference, amount, status, failure_reason, created_at, confirmed_at
        FROM payments WHERE order_id = ? ORDER BY id DESC`, [orderId]);
   order.returns = await query(`SELECT id, reason, status, decision_note, created_at FROM return_requests WHERE order_id = ?`, [orderId]);
+  // Numéro qui recevra un éventuel remboursement (numéro du paiement en ligne confirmé)
+  const paid = await queryOne(
+    `SELECT provider, COALESCE(payer_account, payer_phone) AS phone FROM payments
+      WHERE order_id = ? AND status IN ('succeeded','refunding','partially_refunded','refunded') ORDER BY id DESC LIMIT 1`, [orderId]);
+  order.refund_phone = paid?.phone || null;
+  order.refund_provider = paid?.provider || null;
+  // Aperçu du remboursement en cas d'annulation : montant payé en ligne moins les frais de remboursement
+  if (['succeeded', 'partially_paid'].includes(order.payment_status) && ['pending', 'confirmed'].includes(order.status)) {
+    const rate = (await pricingRates()).refundFee;
+    order.refund_estimate = { paid: Number(order.upfront_amount), rate, ...refundSplit(order.upfront_amount, rate) };
+  }
   order.status_label = ORDER_STATUS_LABELS[order.status];
   order.payment_method_label = PAYMENT_METHODS[order.payment_method] || order.payment_method;
   order.payment_plan_label = PAYMENT_PLANS[order.payment_plan];

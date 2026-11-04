@@ -1,12 +1,17 @@
 import { Router } from 'express';
-import { query, queryOne } from '../config/db.js';
+import { pool, query, queryOne } from '../config/db.js';
 import { optionalAuth } from '../middleware/auth.js';
 import { notFound, ok, pageMeta, paginate } from '../utils/http.js';
 import { listCards, PRODUCT_FROM, PUBLIC_WHERE, SORTS } from '../services/catalog.js';
 import { getSettings } from '../services/common.js';
 import { allProviders } from '../config/paymentProviders.js';
 import { FEATURED_SQL } from '../services/promotions.js';
-import { pricingRates } from '../services/pricing.js';
+import { loadDeliveryZones, pricingRates } from '../services/pricing.js';
+
+/** Tarifs par zone affichés aux clients (sans la clé de recherche interne). */
+const publicZones = (zones) => zones.map((z) => ({
+  type: z.zone_type, name: z.name, fee: z.fee == null ? null : Number(z.fee), delivers: Boolean(z.delivers),
+}));
 
 const router = Router();
 
@@ -123,6 +128,8 @@ router.get('/products/:idOrSlug', optionalAuth, async (req, res) => {
     free_threshold: Number(shop.free_delivery_threshold),
     shop_pickup: Boolean(shop.allow_shop_pickup),
     note: shop.delivery_info,
+    // Tarifs fixés par le vendeur commune par commune (Abidjan) et ville par ville
+    zones: publicZones(await loadDeliveryZones(pool, product.shop_id)),
   };
   const rates = await pricingRates();
   product.payment_terms = { deposit_rate: rates.deposit, half_rate: rates.half, cash_on_delivery: rates.cashOnDelivery };
@@ -160,6 +167,7 @@ router.get('/shops/:slug', async (req, res) => {
     [req.params.slug],
   );
   if (!shop) throw notFound('Boutique introuvable');
+  shop.delivery_zones = publicZones(await loadDeliveryZones(pool, shop.id));
   ok(res, shop);
 });
 

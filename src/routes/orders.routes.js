@@ -8,7 +8,8 @@ import {
   cancelOrder, createOrderFromCart, loadOrderDetail, ORDER_STATUS_LABELS, quoteOrder, resolveShopId,
 } from '../services/orders.js';
 import { autoRefund, providerInstructions, refundMessage } from '../services/payments.js';
-import { deliveryOptions } from '../services/pricing.js';
+import { jekoPhone } from '../services/jeko.js';
+import { deliveryOptions, isAbidjan, loadDeliveryZones } from '../services/pricing.js';
 import { loadCart } from './cart.routes.js';
 import { getSetting, notifyAdmins } from '../services/common.js';
 
@@ -30,16 +31,22 @@ router.post('/quote', validate(z.object({
   promo_code: z.string().trim().max(40).optional(),
 })), async (req, res) => {
   const d = req.valid;
-  const address = await queryOne(`SELECT city FROM addresses WHERE id = ? AND user_id = ?`, [d.address_id, req.user.id]);
+  const address = await queryOne(`SELECT city, commune FROM addresses WHERE id = ? AND user_id = ?`, [d.address_id, req.user.id]);
   if (!address) throw badRequest('Adresse invalide');
   const shopId = await resolveShopId(req.user.id, d.shop_id);
   const shop = await queryOne(`SELECT * FROM shops WHERE id = ?`, [shopId]);
   if (!shop) throw notFound('Boutique introuvable');
   const cart = await loadCart(req.user.id);
   const shopSubtotal = cart.items.filter((i) => i.shop_id === shopId && i.available).reduce((s, i) => s + i.line_total, 0);
-  const options = deliveryOptions(shop, address.city, shopSubtotal);
+  // Tarif de la commune (Abidjan) ou de la ville fixé par le vendeur, sinon son tarif par défaut
+  const zones = await loadDeliveryZones(pool, shopId);
+  const options = deliveryOptions(shop, address, shopSubtotal, zones);
+  if (!options.length) {
+    const where = isAbidjan(address.city) && address.commune ? `la commune de ${address.commune}` : address.city;
+    throw badRequest(`${shop.name} ne livre pas à ${where}. Choisissez une autre adresse.`, { address_id: 'Zone non desservie' });
+  }
   const mode = options.some((o) => o.mode === d.delivery_mode) ? d.delivery_mode : options[0].mode;
-  const params = { shopId, city: address.city, deliveryMode: mode, plan: d.payment_plan, promoCode: d.promo_code };
+  const params = { shopId, address, deliveryMode: mode, plan: d.payment_plan, promoCode: d.promo_code };
   // Un code promo invalide n'empêche pas le devis : le motif est renvoyé pour être affiché
   let q;
   let promo_error = null;
@@ -115,8 +122,19 @@ router.get('/:id/tracking', async (req, res) => {
   });
 });
 
-router.post('/:id/cancel', validate(z.object({ reason: z.string().trim().max(255).optional() })), async (req, res) => {
+router.post('/:id/cancel', validate(z.object({
+  reason: z.string().trim().max(255).optional(),
+  // Numéro Mobile Money qui recevra le remboursement (Wave / Orange ne transmettent pas le compte réellement débité)
+  refund_phone: z.string().trim().max(30).optional(),
+})), async (req, res) => {
   await ownOrder(req);
+  if (req.valid.refund_phone) {
+    const phone = jekoPhone(req.valid.refund_phone);
+    if (!phone) throw badRequest('Numéro de remboursement invalide', { refund_phone: 'Numéro ivoirien à 10 chiffres (01, 05 ou 07…)' });
+    await query(
+      `UPDATE payments SET payer_account = ? WHERE order_id = ? AND status IN ('succeeded','refunding','partially_refunded')`,
+      [phone, Number(req.params.id)]);
+  }
   const r = await cancelOrder(Number(req.params.id), req.user, req.valid.reason || 'Annulée par le client');
   // La part payée en ligne est remboursée automatiquement (virement Jèko vers le numéro qui a payé)
   const refund = r.refunding ? await autoRefund(Number(req.params.id), 'Annulée par le client') : null;

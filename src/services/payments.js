@@ -1,10 +1,11 @@
 import crypto from 'node:crypto';
 import env from '../config/env.js';
-import { query, queryOne, transaction } from '../config/db.js';
+import { pool, query, queryOne, transaction } from '../config/db.js';
 import { badRequest, notFound, unauthorized } from '../utils/http.js';
 import { money, randomCode } from '../utils/helpers.js';
+import { pricingRates, refundSplit } from './pricing.js';
 import { confirmOrder } from './orders.js';
-import { notify, notifyAdmins } from './common.js';
+import { getSettings, notify, notifyAdmins } from './common.js';
 import * as jeko from './jeko.js';
 
 /**
@@ -34,11 +35,11 @@ const SETTLED = ['succeeded', 'refunding', 'partially_refunded', 'refunded'];
 // =====================================================================
 
 /** Paiement encaissé. Si la commande n'attend plus ce paiement (annulée, déjà payée), il est mis à rembourser. */
-async function applyPaymentSuccess(conn, payment, order, providerRef) {
+async function applyPaymentSuccess(conn, payment, order, { transactionId = null, payerAccount = null } = {}) {
   const awaiting = order.status === 'pending' && !['succeeded', 'partially_paid'].includes(order.payment_status);
   if (!awaiting) {
-    await conn.query(`UPDATE payments SET status = 'refunding', provider_reference = COALESCE(?, provider_reference), confirmed_at = NOW() WHERE id = ?`,
-      [providerRef || null, payment.id]);
+    await conn.query(`UPDATE payments SET status = 'refunding', provider_transaction_id = COALESCE(?, provider_transaction_id),
+       payer_account = COALESCE(?, payer_account), confirmed_at = NOW() WHERE id = ?`, [transactionId, payerAccount, payment.id]);
     await conn.query(
       `INSERT INTO refunds (payment_id, order_id, reference, amount, reason, status) VALUES (?, ?, ?, ?, ?, 'pending')`,
       [payment.id, order.id, `REF-${randomCode(10)}`, payment.amount,
@@ -47,8 +48,10 @@ async function applyPaymentSuccess(conn, payment, order, providerRef) {
     return { status: 'refund_required', order };
   }
   await conn.query(
-    `UPDATE payments SET status = 'succeeded', provider_reference = COALESCE(?, provider_reference), confirmed_at = NOW(), failure_reason = NULL WHERE id = ?`,
-    [providerRef || null, payment.id]);
+    // provider_reference (demande de paiement Jèko) est conservé ; payer_account = numéro réellement débité
+    `UPDATE payments SET status = 'succeeded', provider_transaction_id = COALESCE(?, provider_transaction_id),
+       payer_account = COALESCE(?, payer_account), confirmed_at = NOW(), failure_reason = NULL WHERE id = ?`,
+    [transactionId, payerAccount, payment.id]);
   // Totalité payée → « succeeded » ; moitié ou acompte → « partially_paid » (solde réglé au vendeur à la livraison)
   const partial = Number(order.balance_amount) > 0;
   await conn.query(`UPDATE orders SET payment_status = ?, paid_at = IF(?, paid_at, NOW()) WHERE id = ?`,
@@ -88,12 +91,18 @@ async function alertLateRefund(result) {
 /** Message affiché après une annulation, selon l'issue du remboursement automatique. */
 export function refundMessage(refund, base, forAdmin = false) {
   if (!refund) return base;
+  // Frais de remboursement conservés par la plateforme (3 % par défaut)
+  const fee = refund.fee > 0 ? ` (${refund.fee} FCFA de frais de remboursement retenus)` : '';
   if (refund.status === 'succeeded') {
-    return forAdmin ? `${base} : client remboursé de ${refund.amount} FCFA` : `${base}. ${refund.amount} FCFA vous ont été remboursés.`;
+    return forAdmin ? `${base} : client remboursé de ${refund.amount} FCFA${fee}` : `${base}. ${refund.amount} FCFA vous ont été remboursés${fee}.`;
   }
   if (refund.status === 'processing') {
-    return forAdmin ? `${base} : virement de ${refund.amount} FCFA envoyé au client`
-      : `${base}. Remboursement de ${refund.amount} FCFA envoyé sur votre compte Mobile Money.`;
+    return forAdmin ? `${base} : virement de ${refund.amount} FCFA envoyé au client${fee}`
+      : `${base}. Remboursement de ${refund.amount} FCFA envoyé sur votre compte Mobile Money${fee}.`;
+  }
+  if (refund.status === 'waiting') {
+    return forAdmin ? `${base} : remboursement de ${refund.amount} FCFA en attente de solde Jèko (relance automatique)${fee}`
+      : `${base}. Votre remboursement de ${refund.amount} FCFA sera envoyé automatiquement sur votre compte Mobile Money${fee}.`;
   }
   return forAdmin ? `${base} : remboursement automatique impossible, à traiter` : `${base}. Votre remboursement sera traité par notre équipe.`;
 }
@@ -163,7 +172,7 @@ export async function processWebhook(provider, rawBody, signature) {
         await conn.query(`UPDATE payments SET status = 'failed', failure_reason = 'Montant incohérent' WHERE id = ?`, [payment.id]);
         throw badRequest('Montant ou devise incohérent');
       }
-      r = await applyPaymentSuccess(conn, payment, order, providerRef);
+      r = await applyPaymentSuccess(conn, payment, order, { transactionId: providerRef });
     } else if (type === 'payment.failed' || type === 'payment.cancelled') {
       r = await applyPaymentFailure(conn, payment, order, type === 'payment.failed' ? 'failed' : 'cancelled', reason);
     }
@@ -246,7 +255,8 @@ export async function syncJekoPayment(paymentId) {
         return null;
       }
       const [[order]] = await conn.query(`SELECT * FROM orders WHERE id = ? FOR UPDATE`, [payment.order_id]);
-      return applyPaymentSuccess(conn, payment, order, pr.transaction?.id || pr.id);
+      return applyPaymentSuccess(conn, payment, order,
+        { transactionId: pr.transaction?.id || null, payerAccount: pr.transaction?.counterpartIdentifier || null });
     });
     await alertLateRefund(result);
   } else if (pr.status === 'error' && p.status === 'pending') {
@@ -307,7 +317,7 @@ export async function processJekoWebhook(rawBody, signature, eventName) {
         return { ignored: true, reason: 'montant incohérent' };
       }
       const [[order]] = await conn.query(`SELECT * FROM orders WHERE id = ? FOR UPDATE`, [payment.order_id]);
-      return applyPaymentSuccess(conn, payment, order, tx.id);
+      return applyPaymentSuccess(conn, payment, order, { transactionId: tx.id, payerAccount: tx.counterpartIdentifier || null });
     });
     await alertLateRefund(result);
   } else if (tx.transactionType === 'transfer') {
@@ -328,8 +338,9 @@ async function finalizeRefund(conn, refundId, actorId) {
   const [[payment]] = await conn.query(`SELECT * FROM payments WHERE id = ? FOR UPDATE`, [refund.payment_id]);
   const [[order]] = await conn.query(`SELECT * FROM orders WHERE id = ? FOR UPDATE`, [refund.order_id]);
   await conn.query(`UPDATE refunds SET status = 'succeeded', failure_reason = NULL WHERE id = ?`, [refund.id]);
+  // Remboursé intégralement = sommes versées + frais de remboursement conservés par la plateforme
   const [[{ done }]] = await conn.query(
-    `SELECT COALESCE(SUM(amount), 0) AS done FROM refunds WHERE payment_id = ? AND status = 'succeeded'`, [payment.id]);
+    `SELECT COALESCE(SUM(amount + fee_amount), 0) AS done FROM refunds WHERE payment_id = ? AND status = 'succeeded'`, [payment.id]);
   const full = Number(done) >= Number(payment.amount);
   await conn.query(`UPDATE payments SET status = ? WHERE id = ?`, [full ? 'refunded' : 'partially_refunded', payment.id]);
   // Un paiement tardif ou en double ne change pas le statut de la commande
@@ -350,13 +361,15 @@ async function finalizeRefund(conn, refundId, actorId) {
       await conn.query(`UPDATE return_requests SET status = 'refunded' WHERE order_id = ? AND status = 'accepted'`, [order.id]);
     }
   }
+  const feeNote = Number(refund.fee_amount) > 0 ? ` (frais de remboursement de ${money(refund.fee_amount)} FCFA retenus)` : '';
   await conn.query(`INSERT INTO order_status_history (order_id, status, comment, changed_by) VALUES (?, ?, ?, ?)`,
-    [order.id, full ? 'refunded' : 'partially_refunded', `Remboursement de ${money(refund.amount)} FCFA : ${refund.reason || ''}`, actorId || null]);
+    [order.id, full ? 'refunded' : 'partially_refunded', `Remboursement de ${money(refund.amount)} FCFA${feeNote} : ${refund.reason || ''}`, actorId || null]);
   await notify(order.user_id, {
     type: 'refund', title: 'Remboursement effectué',
-    body: `${money(refund.amount)} FCFA ont été remboursés pour la commande ${order.order_number}.`, link: `/compte/commandes/${order.id}`,
+    body: `${money(refund.amount)} FCFA ont été remboursés pour la commande ${order.order_number}${feeNote}.`,
+    link: `/compte/commandes/${order.id}`,
   }, conn);
-  return { amount: Number(refund.amount), full };
+  return { amount: Number(refund.amount), fee: Number(refund.fee_amount), full };
 }
 
 /**
@@ -372,48 +385,128 @@ export async function requestRefund(orderId, { amount: wanted, reason }, actorId
         ORDER BY status = 'refunding' DESC, id DESC LIMIT 1 FOR UPDATE`,
       [order.id]);
     if (!payment) throw badRequest('Aucun paiement confirmé à rembourser');
+    // Déjà engagé : sommes versées ou en cours de virement + frais déjà retenus
     const [[{ engaged }]] = await conn.query(
-      `SELECT COALESCE(SUM(amount), 0) AS engaged FROM refunds WHERE payment_id = ? AND status IN ('succeeded','processing')`, [payment.id]);
+      `SELECT COALESCE(SUM(amount + fee_amount), 0) AS engaged FROM refunds WHERE payment_id = ? AND status IN ('succeeded','processing')`, [payment.id]);
     const remaining = money(Number(payment.amount) - Number(engaged));
     if (remaining <= 0) throw badRequest('Ce paiement est déjà remboursé ou en cours de remboursement');
-    const amount = money(wanted ?? remaining);
-    if (amount > remaining) throw badRequest(`Montant supérieur au reste remboursable (${remaining} FCFA)`);
-    // Une demande « pending » (créée à l'annulation) du même montant est reprise
+    // Montant libre saisi par l'administration : versé tel quel. Sinon : reste à rembourser moins les frais (3 %).
+    let amount;
+    let fee = 0;
+    if (wanted != null) {
+      amount = money(wanted);
+      if (amount > remaining) throw badRequest(`Montant supérieur au reste remboursable (${remaining} FCFA)`);
+    } else {
+      ({ amount, fee } = refundSplit(remaining, (await pricingRates()).refundFee));
+    }
+    // Une demande en attente ou en échec pour ce paiement (ex. créée à l'annulation) est reprise
     const [[pending]] = await conn.query(
-      `SELECT id FROM refunds WHERE payment_id = ? AND status IN ('pending','failed') AND amount = ? ORDER BY id LIMIT 1 FOR UPDATE`, [payment.id, amount]);
+      `SELECT id FROM refunds WHERE payment_id = ? AND status IN ('pending','failed') ORDER BY id LIMIT 1 FOR UPDATE`, [payment.id]);
     let refundId = pending?.id;
     // Nouvelle référence à chaque envoi : Jèko refuse une référence déjà utilisée
     const reference = `REF-${randomCode(10)}`;
     if (refundId) {
-      await conn.query(`UPDATE refunds SET status = 'processing', reference = ?, reason = COALESCE(?, reason), created_by = ? WHERE id = ?`,
-        [reference, reason, actorId, refundId]);
+      await conn.query(`UPDATE refunds SET status = 'processing', reference = ?, amount = ?, fee_amount = ?, failure_reason = NULL,
+          reason = COALESCE(?, reason), created_by = ? WHERE id = ?`, [reference, amount, fee, reason, actorId, refundId]);
     } else {
       const [r] = await conn.query(
-        `INSERT INTO refunds (payment_id, order_id, reference, amount, reason, status, created_by) VALUES (?, ?, ?, ?, ?, 'processing', ?)`,
-        [payment.id, order.id, reference, amount, reason, actorId]);
+        `INSERT INTO refunds (payment_id, order_id, reference, amount, fee_amount, reason, status, created_by) VALUES (?, ?, ?, ?, ?, ?, 'processing', ?)`,
+        [payment.id, order.id, reference, amount, fee, reason, actorId]);
       refundId = r.insertId;
     }
-    if (!isJeko()) return { refundId, amount, done: await finalizeRefund(conn, refundId, actorId) };
+    if (!isJeko()) return { refundId, amount, fee, done: await finalizeRefund(conn, refundId, actorId) };
     const [[user]] = await conn.query(`SELECT first_name, last_name, phone FROM users WHERE id = ?`, [order.user_id]);
-    return { refundId, amount, reference, payment, order, user };
+    return { refundId, amount, fee, reference, payment, order, user };
   });
-  if (prepared.done) return { amount: prepared.amount, status: 'succeeded', full: prepared.done.full };
+  if (prepared.done) return { amount: prepared.amount, fee: prepared.fee, status: 'succeeded', full: prepared.done.full };
+  return { ...await sendRefund(prepared, actorId), fee: prepared.fee };
+}
 
-  const { refundId, amount, reference, payment, order, user } = prepared;
-  const phone = jeko.jekoPhone(payment.payer_phone) || jeko.jekoPhone(user.phone);
+/** Jèko : envoi du virement de remboursement (contrôles du numéro, du minimum et du solde). */
+async function sendRefund({ refundId, amount, reference, payment, order, user }, actorId) {
+  // Le remboursement part sur le compte réellement débité, jamais sur un numéro deviné
+  const phone = await payerAccount(payment);
   if (!phone || !jeko.JEKO_METHODS[payment.provider]) {
-    await query(`UPDATE refunds SET status = 'failed', failure_reason = ? WHERE id = ?`, ['Numéro Mobile Money du client inconnu', refundId]);
-    throw badRequest('Numéro Mobile Money du client introuvable : remboursez-le manuellement.');
+    await query(`UPDATE refunds SET status = 'failed', failure_reason = ? WHERE id = ?`, ['Compte Mobile Money du payeur inconnu', refundId]);
+    throw badRequest('Compte Mobile Money du payeur introuvable chez Jèko : remboursez-le manuellement.');
   }
   // Jèko refuse les virements de moins de 5 FCFA (500 centimes)
   if (jeko.toCents(amount) < 500) {
     await query(`UPDATE refunds SET status = 'failed', failure_reason = ? WHERE id = ?`, ['Montant inférieur au minimum Jèko (5 FCFA)', refundId]);
     throw badRequest(`Montant de ${amount} FCFA inférieur au minimum de virement Jèko (5 FCFA) : remboursez manuellement.`);
   }
+  // Solde du magasin insuffisant : le remboursement attend et sera relancé automatiquement
+  const balance = await jeko.getStoreBalance().catch(() => null);
+  if (balance != null && balance < jeko.toCents(amount)) return waitForBalance(refundId, amount, order, balance);
   return sendTransfer('refund', refundId, {
     amount, reference, method: payment.provider, phone, name: `${user.first_name} ${user.last_name}`,
     description: `Remboursement commande ${order.order_number}`,
   }, actorId);
+}
+
+/**
+ * Numéro qui reçoit le remboursement, par ordre de priorité :
+ * 1. payer_account : numéro confirmé par le client à l'annulation (ou corrigé par l'administration) ;
+ * 2. numéro du payeur enregistré par Jèko ;
+ * 3. numéro saisi au paiement.
+ * Avec Wave et Orange, l'opérateur ne transmet pas le compte réellement débité : Jèko enregistre le numéro saisi.
+ * D'où la confirmation du numéro par le client au moment de l'annulation.
+ */
+async function payerAccount(payment) {
+  let account = jeko.jekoPhone(payment.payer_account);
+  if (!account && payment.provider_reference) {
+    const pr = await jeko.getPaymentRequest(payment.provider_reference).catch(() => null);
+    account = jeko.jekoPhone(pr?.transaction?.counterpartIdentifier);
+  }
+  return account || jeko.jekoPhone(payment.payer_phone);
+}
+
+/** Remboursement en attente de solde : relancé automatiquement ; l'administration est prévenue une seule fois. */
+const WAITING_BALANCE = 'En attente : solde Jèko insuffisant, nouvel essai automatique';
+async function waitForBalance(refundId, amount, order, balanceCents = null) {
+  const before = await queryOne(`SELECT failure_reason FROM refunds WHERE id = ?`, [refundId]);
+  await query(`UPDATE refunds SET status = 'pending', failure_reason = ? WHERE id = ?`, [WAITING_BALANCE, refundId]);
+  if (before?.failure_reason !== WAITING_BALANCE) {
+    await notifyAdmins({
+      type: 'refund', title: 'Solde Jèko insuffisant pour rembourser',
+      body: `Remboursement de ${money(amount)} FCFA (commande ${order.order_number}) en attente`
+        + `${balanceCents != null ? ` — solde actuel ${jeko.fromCents(balanceCents)} FCFA` : ''}. Rechargez votre magasin Jèko : il partira automatiquement.`,
+      link: `/admin/commandes/${order.id}`,
+    });
+  }
+  return { amount: Number(amount), status: 'waiting' };
+}
+
+/** Relance automatique des remboursements en attente (solde insuffisant au premier essai). */
+export async function retryPendingRefunds() {
+  if (!isJeko()) return 0;
+  const rows = await query(
+    `SELECT order_id, amount, reason FROM refunds WHERE status = 'pending' AND failure_reason = ? AND created_at > NOW() - INTERVAL 30 DAY`,
+    [WAITING_BALANCE]);
+  let sent = 0;
+  for (const r of rows) {
+    try {
+      // Montant recalculé (reste à rembourser moins les frais de remboursement)
+      const res = await requestRefund(r.order_id, { reason: r.reason }, null);
+      if (res.status !== 'waiting') sent += 1;
+    } catch (e) {
+      console.error('[REMBOURSEMENT AUTO] relance', r.order_id, e.message);
+    }
+  }
+  return sent;
+}
+
+/** Statut des virements en cours vérifié auprès de Jèko (si un webhook n'est pas arrivé, ex. tunnel coupé). */
+export async function syncProcessingTransfers() {
+  if (!isJeko()) return;
+  const rows = [
+    ...await query(`SELECT reference, provider_reference FROM refunds WHERE status = 'processing' AND provider_reference IS NOT NULL`),
+    ...await query(`SELECT reference, provider_reference FROM seller_payouts WHERE status = 'pending' AND provider_reference IS NOT NULL`),
+  ];
+  for (const r of rows) {
+    const t = await jeko.getTransfer(r.provider_reference).catch(() => null);
+    if (t && t.status !== 'pending') await applyTransferResult(r.reference, t.status, t.id, t.status === 'error' ? 'Virement refusé par l’opérateur' : null);
+  }
 }
 
 // =====================================================================
@@ -455,6 +548,96 @@ export async function sendPayout(payoutId, actorId) {
   }, actorId);
 }
 
+/**
+ * Solde reversable d'une boutique : ventes créditées depuis au moins delayDays jours (livraison),
+ * plus les écritures négatives (remboursements, ajustements), moins les reversements payés ou en cours.
+ */
+export async function shopPayableBalance(executor, shopId, delayDays = 0) {
+  const [[r]] = await executor.query(
+    `SELECT
+       (SELECT COALESCE(SUM(amount), 0) FROM seller_ledger_entries WHERE shop_id = ?
+          AND (entry_type NOT IN ('sale','commission') OR created_at <= NOW() - INTERVAL ? DAY)) -
+       (SELECT COALESCE(SUM(amount), 0) FROM seller_payouts WHERE shop_id = ? AND status IN ('paid','pending')) AS balance`,
+    [shopId, Number(delayDays) || 0, shopId]);
+  return money(r.balance);
+}
+
+/** Crée un reversement (administration ou automatique), dans la limite du solde reversable. */
+export async function createPayout(shopId, amount, note, actorId, { delayDays = 0 } = {}) {
+  return transaction(async (conn) => {
+    // Verrou sur la boutique : deux reversements simultanés ne peuvent pas dépasser le solde
+    const [[shop]] = await conn.query(`SELECT * FROM shops WHERE id = ? FOR UPDATE`, [shopId]);
+    if (!shop) throw notFound('Boutique introuvable');
+    const balance = await shopPayableBalance(conn, shopId, delayDays);
+    const value = money(amount ?? balance);
+    if (value <= 0 || value > balance) throw badRequest(`Montant supérieur au solde disponible (${balance} FCFA)`);
+    const reference = `PO-${randomCode(10)}`;
+    const [r] = await conn.query(
+      `INSERT INTO seller_payouts (shop_id, reference, amount, method, status, note, created_by) VALUES (?, ?, ?, ?, 'pending', ?, ?)`,
+      [shopId, reference, value, shop.payout_method, note || null, actorId || null]);
+    return { id: r.insertId, reference, amount: value };
+  });
+}
+
+const PAYOUT_LOW_BALANCE = 'Solde Jèko insuffisant pour les reversements';
+
+/**
+ * Reversement automatique d'une boutique (après livraison) : tout le solde reversable part par virement Jèko
+ * sur son compte Mobile Money. Ignoré si désactivé, compte bancaire ou incomplet, montant < 5 FCFA,
+ * ou échec récent (évite de relancer en boucle un numéro erroné). Solde Jèko insuffisant : nouvel essai plus tard.
+ */
+export async function autoPayoutShop(shopId) {
+  if (!isJeko()) return null;
+  const s = await getSettings();
+  if (String(s.auto_payouts ?? '1') !== '1') return null;
+  const shop = await queryOne(`SELECT id, name, status, payout_method, payout_account FROM shops WHERE id = ?`, [shopId]);
+  if (!shop || !['approved', 'suspended'].includes(shop.status)) return null;
+  if (!jeko.JEKO_METHODS[shop.payout_method] || !jeko.jekoPhone(shop.payout_account)) return null;
+  const recentFailure = await queryOne(
+    `SELECT id FROM seller_payouts WHERE shop_id = ? AND status = 'failed' AND created_at > NOW() - INTERVAL 1 DAY LIMIT 1`, [shopId]);
+  if (recentFailure) return null;
+  const delayDays = Number(s.payout_delay_days ?? 0);
+  const balance = await shopPayableBalance(pool, shopId, delayDays);
+  if (jeko.toCents(balance) < 500) return null; // minimum de virement Jèko : 5 FCFA
+  const storeBalance = await jeko.getStoreBalance().catch(() => null);
+  if (storeBalance != null && storeBalance < jeko.toCents(balance)) {
+    // Une seule alerte par jour à l'administration
+    const alerted = await queryOne(
+      `SELECT id FROM notifications WHERE title = ? AND created_at > NOW() - INTERVAL 1 DAY LIMIT 1`, [PAYOUT_LOW_BALANCE]);
+    if (!alerted) {
+      await notifyAdmins({
+        type: 'payout', title: PAYOUT_LOW_BALANCE,
+        body: `${shop.name} attend ${money(balance)} FCFA (solde Jèko : ${jeko.fromCents(storeBalance)} FCFA). Le reversement partira automatiquement après rechargement.`,
+        link: '/admin/reversements',
+      });
+    }
+    return { status: 'waiting' };
+  }
+  let payout;
+  try {
+    payout = await createPayout(shopId, balance, 'Reversement automatique après livraison', null, { delayDays });
+  } catch {
+    return null; // solde modifié entre-temps : le prochain passage s'en chargera
+  }
+  return sendPayout(payout.id, null).catch((e) => {
+    console.error('[REVERSEMENT AUTO]', shop.name, e.message);
+    return { status: 'failed' };
+  });
+}
+
+/** Passage périodique : reverse automatiquement toutes les boutiques qui ont un solde (délai de retours écoulé). */
+export async function runAutoPayouts() {
+  if (!isJeko()) return 0;
+  const shops = await query(
+    `SELECT DISTINCT e.shop_id AS id FROM seller_ledger_entries e JOIN shops s ON s.id = e.shop_id WHERE s.status IN ('approved','suspended')`);
+  let sent = 0;
+  for (const { id } of shops) {
+    const r = await autoPayoutShop(id).catch((e) => { console.error('[REVERSEMENT AUTO]', id, e.message); return null; });
+    if (r && !['waiting', 'failed'].includes(r.status)) sent += 1;
+  }
+  return sent;
+}
+
 // =====================================================================
 // Virements Jèko (remboursements et reversements)
 // =====================================================================
@@ -466,6 +649,11 @@ async function sendTransfer(kind, id, params, actorId) {
   try {
     t = await jeko.createTransfer(params);
   } catch (e) {
+    // Solde insuffisant (frais de virement compris) : le remboursement attend, il sera relancé automatiquement
+    if (kind === 'refund' && e.jekoId === 'insufficient_balance') {
+      const r = await queryOne(`SELECT r.id, r.amount, o.id AS order_id, o.order_number FROM refunds r JOIN orders o ON o.id = r.order_id WHERE r.id = ?`, [id]);
+      return waitForBalance(r.id, r.amount, { id: r.order_id, order_number: r.order_number });
+    }
     await applyTransferResult(params.reference, 'error', null, e.message, kind);
     e.adminsNotified = true; // applyTransferResult a déjà prévenu l'administration
     throw e;

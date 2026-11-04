@@ -3,7 +3,9 @@ import app from './app.js';
 import env from './config/env.js';
 import { pool } from './config/db.js';
 import { expireUnpaidOrders } from './services/orders.js';
-import { syncPendingJekoPayments } from './services/payments.js';
+import {
+  retryPendingRefunds, runAutoPayouts, syncPendingJekoPayments, syncProcessingTransfers,
+} from './services/payments.js';
 import { initRealtime } from './realtime.js';
 
 async function start() {
@@ -28,6 +30,23 @@ async function start() {
       .then((n) => n && console.log(`[EXPIRATION] ${n} commande(s) non payée(s) annulée(s)`))
       .catch((e) => console.error('[EXPIRATION]', e.message));
   }, 5 * 60 * 1000);
+
+  // Remboursements automatiques : issue des virements vérifiée auprès de Jèko (même sans webhook)
+  // et relance des remboursements en attente de solde
+  setInterval(() => {
+    syncProcessingTransfers().catch((e) => console.error('[VIREMENTS]', e.message));
+  }, 2 * 60 * 1000);
+  setInterval(() => {
+    retryPendingRefunds()
+      .then((n) => n && console.log(`[REMBOURSEMENT AUTO] ${n} remboursement(s) relancé(s)`))
+      .catch((e) => console.error('[REMBOURSEMENT AUTO]', e.message));
+  }, 5 * 60 * 1000);
+  // Reversements automatiques aux vendeurs : soldes dont le délai de retours est écoulé, ou en attente de solde Jèko
+  setInterval(() => {
+    runAutoPayouts()
+      .then((n) => n && console.log(`[REVERSEMENT AUTO] ${n} reversement(s) envoyé(s)`))
+      .catch((e) => console.error('[REVERSEMENT AUTO]', e.message));
+  }, 10 * 60 * 1000);
 }
 
 start();

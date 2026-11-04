@@ -145,6 +145,20 @@ CREATE TABLE seller_documents (
 -- ---------------------------------------------------------------------
 -- Catalogue
 -- ---------------------------------------------------------------------
+-- Tarifs de livraison du vendeur par commune d'Abidjan / ville (à défaut : tarifs de la boutique)
+CREATE TABLE shop_delivery_zones (
+  id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  shop_id    INT UNSIGNED NOT NULL,
+  zone_type  ENUM('commune','city') NOT NULL,   -- commune d'Abidjan ou ville de l'intérieur
+  name       VARCHAR(80) NOT NULL,
+  name_key   VARCHAR(80) NOT NULL,              -- nom normalisé (sans accents ni casse) pour la recherche
+  fee        DECIMAL(12,2) NULL,                -- NULL = tarif par défaut de la boutique
+  delivers   TINYINT(1) NOT NULL DEFAULT 1,     -- 0 = la boutique ne livre pas dans cette zone
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_sdz_zone (shop_id, zone_type, name_key),
+  CONSTRAINT fk_sdz_shop FOREIGN KEY (shop_id) REFERENCES shops(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE categories (
   id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   parent_id   INT UNSIGNED NULL,
@@ -360,12 +374,14 @@ CREATE TABLE payments (
   order_id         INT UNSIGNED NOT NULL,
   provider         VARCHAR(30) NOT NULL,       -- orange_money, mtn_momo, wave, moov_money, card, cash_on_delivery
   reference        VARCHAR(60) NOT NULL UNIQUE,
-  provider_reference VARCHAR(120) NULL,
+  provider_reference VARCHAR(120) NULL,        -- Jèko : identifiant de la demande de paiement
+  provider_transaction_id VARCHAR(120) NULL,   -- identifiant de la transaction encaissée
   checkout_url     VARCHAR(500) NULL,
   idempotency_key  VARCHAR(80) NOT NULL UNIQUE,
   amount           DECIMAL(12,2) NOT NULL,
   currency         CHAR(3) NOT NULL DEFAULT 'XOF',
-  payer_phone      VARCHAR(30) NULL,
+  payer_phone      VARCHAR(30) NULL,            -- numéro saisi sur le site
+  payer_account    VARCHAR(40) NULL,            -- numéro réellement débité (renvoyé par Jèko) : reçoit les remboursements
   status           ENUM('initiated','pending','succeeded','failed','cancelled','refunding',
                         'partially_refunded','refunded') NOT NULL DEFAULT 'initiated',
   failure_reason   VARCHAR(255) NULL,
@@ -396,7 +412,8 @@ CREATE TABLE refunds (
   order_id     INT UNSIGNED NOT NULL,
   reference    VARCHAR(60) NOT NULL UNIQUE,
   provider_reference VARCHAR(120) NULL,
-  amount       DECIMAL(12,2) NOT NULL,
+  amount       DECIMAL(12,2) NOT NULL,          -- montant versé au client
+  fee_amount   DECIMAL(12,2) NOT NULL DEFAULT 0, -- frais de remboursement conservés par la plateforme
   reason       VARCHAR(255) NULL,
   status       ENUM('pending','processing','succeeded','failed') NOT NULL DEFAULT 'pending',
   failure_reason VARCHAR(255) NULL,
