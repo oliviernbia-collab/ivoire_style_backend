@@ -21,18 +21,27 @@ export async function queryOne(sql, params = []) {
   return rows[0] || null;
 }
 
-/** Exécute fn(conn) dans une transaction SQL (commit/rollback automatique). */
+/**
+ * Exécute fn(conn) dans une transaction SQL (commit/rollback automatique).
+ * conn.afterCommit(cb) : action lancée seulement si la transaction est validée (ex. événement temps réel).
+ */
 export async function transaction(fn) {
   const conn = await pool.getConnection();
+  const after = [];
+  conn.afterCommit = (cb) => after.push(cb);
   try {
     await conn.beginTransaction();
     const result = await fn(conn);
     await conn.commit();
+    for (const cb of after) {
+      try { cb(); } catch (e) { console.error('[afterCommit]', e.message); }
+    }
     return result;
   } catch (err) {
     await conn.rollback();
     throw err;
   } finally {
+    delete conn.afterCommit;
     conn.release();
   }
 }

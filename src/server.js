@@ -1,8 +1,10 @@
+import http from 'node:http';
 import app from './app.js';
 import env from './config/env.js';
 import { pool } from './config/db.js';
 import { expireUnpaidOrders } from './services/orders.js';
 import { syncPendingJekoPayments } from './services/payments.js';
+import { initRealtime } from './realtime.js';
 
 async function start() {
   try {
@@ -13,7 +15,10 @@ async function start() {
     process.exit(1);
   }
 
-  app.listen(env.port, '0.0.0.0', () => {
+  // Serveur HTTP partagé par l'API et le temps réel (Socket.IO)
+  const server = http.createServer(app);
+  initRealtime(server);
+  server.listen(env.port, '0.0.0.0', () => {
     console.log(`API Ivoire Style prête sur ${env.publicUrl}/api/v1 (paiements : ${env.payment.mode})`);
   });
 

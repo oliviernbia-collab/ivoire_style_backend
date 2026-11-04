@@ -14,7 +14,7 @@ import {
 import { refreshRating } from '../services/catalog.js';
 import { grantSellerRole } from './seller.routes.js';
 import { clientAudience, sellerAudience } from '../services/promotions.js';
-import { requestRefund, sendPayout, setPayoutStatus } from '../services/payments.js';
+import { autoRefund, refundMessage, requestRefund, sendPayout, setPayoutStatus } from '../services/payments.js';
 
 const router = Router();
 router.use(requireAuth, requireRole('admin', 'support'));
@@ -286,7 +286,9 @@ router.get('/orders/:id', async (req, res) => {
 router.post('/orders/:id/cancel', adminOnly, validate(z.object({ reason: z.string().trim().min(3, 'Motif requis').max(255) })), async (req, res) => {
   const r = await cancelOrder(Number(req.params.id), req.user, req.valid.reason, { force: true });
   await audit(req, 'order.cancel', 'order', req.params.id, req.valid);
-  ok(res, await loadOrderDetail(req.params.id), r.refunding ? 'Commande annulée, remboursement à traiter' : 'Commande annulée');
+  // La part payée en ligne est remboursée automatiquement
+  const refund = r.refunding ? await autoRefund(Number(req.params.id), req.valid.reason) : null;
+  ok(res, await loadOrderDetail(req.params.id), refundMessage(refund, 'Commande annulée', true));
 });
 
 /** Remboursement (total ou partiel) dans la limite du paiement d'origine ; en mode Jèko, virement vers le client. */

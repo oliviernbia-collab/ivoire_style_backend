@@ -1,10 +1,19 @@
 import { query, queryOne } from '../config/db.js';
+import { emitToStaff, emitToUser } from '../realtime.js';
 
 export async function notify(userId, { type, title, body = null, link = null }, conn = null) {
   const sql = `INSERT INTO notifications (user_id, type, title, body, link) VALUES (?, ?, ?, ?, ?)`;
   const params = [userId, type, title, body, link];
   if (conn) await conn.query(sql, params);
   else await query(sql, params);
+  // Temps réel : le destinataire reçoit la notification, l'administration rafraîchit ses écrans.
+  // Dans une transaction, l'envoi attend la validation (sinon les écrans rechargeraient d'anciennes données).
+  const push = () => {
+    emitToUser(userId, 'notification', { type, title, body, link });
+    emitToStaff('refresh', { type });
+  };
+  if (conn?.afterCommit) conn.afterCommit(push);
+  else push();
   // Point d'extension : envoi push (Firebase Cloud Messaging) / e-mail / SMS.
 }
 

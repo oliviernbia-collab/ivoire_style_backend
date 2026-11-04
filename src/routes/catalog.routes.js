@@ -154,7 +154,8 @@ router.get('/shops/:slug', async (req, res) => {
     `SELECT s.id, s.name, s.slug, s.description, s.logo_url, s.banner_url, s.city, s.commune, s.created_at, s.is_official,
        s.delivery_fee_abidjan, s.delivery_fee_other, s.free_delivery_threshold, s.allow_shop_pickup, s.delivery_info,
        (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.status = 'published') AS product_count,
-       (SELECT ROUND(AVG(p.rating_avg), 1) FROM products p WHERE p.shop_id = s.id AND p.rating_count > 0) AS rating
+       (SELECT ROUND(AVG(p.rating_avg), 1) FROM products p WHERE p.shop_id = s.id AND p.rating_count > 0) AS rating,
+       (SELECT COALESCE(SUM(p.rating_count), 0) FROM products p WHERE p.shop_id = s.id AND p.status = 'published') AS review_count
      FROM shops s WHERE s.slug = ? AND s.status = 'approved'`,
     [req.params.slug],
   );
@@ -205,6 +206,8 @@ router.get('/settings/public', async (_req, res) => {
     payment_mode: process.env.PAYMENT_MODE || 'sandbox',
     contact_phone: s.contact_phone,
     contact_email: s.contact_email,
+    // Liens de partage avec aperçu (image, nom) sur WhatsApp / Facebook : servis par l'API (/partage/...)
+    share_base_url: (process.env.SHARE_BASE_URL || process.env.API_PUBLIC_URL || '').replace(/\/$/, ''),
   });
 });
 

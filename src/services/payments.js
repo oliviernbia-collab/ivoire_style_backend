@@ -79,14 +79,46 @@ async function applyPaymentFailure(conn, payment, order, status, reason) {
   return { status };
 }
 
+/** Paiement arrivé alors que la commande ne l'attendait plus (annulée, déjà payée) : remboursement automatique. */
 async function alertLateRefund(result) {
   if (result?.status !== 'refund_required') return;
-  await notifyAdmins({
-    type: 'refund',
-    title: 'Remboursement à traiter',
-    body: `Un paiement est arrivé pour la commande ${result.order.order_number} alors qu’elle n’attendait plus de paiement.`,
-    link: `/admin/commandes/${result.order.id}`,
-  });
+  await autoRefund(result.order.id, 'Paiement reçu alors que la commande ne l’attendait plus');
+}
+
+/** Message affiché après une annulation, selon l'issue du remboursement automatique. */
+export function refundMessage(refund, base, forAdmin = false) {
+  if (!refund) return base;
+  if (refund.status === 'succeeded') {
+    return forAdmin ? `${base} : client remboursé de ${refund.amount} FCFA` : `${base}. ${refund.amount} FCFA vous ont été remboursés.`;
+  }
+  if (refund.status === 'processing') {
+    return forAdmin ? `${base} : virement de ${refund.amount} FCFA envoyé au client`
+      : `${base}. Remboursement de ${refund.amount} FCFA envoyé sur votre compte Mobile Money.`;
+  }
+  return forAdmin ? `${base} : remboursement automatique impossible, à traiter` : `${base}. Votre remboursement sera traité par notre équipe.`;
+}
+
+/**
+ * Remboursement automatique de la part payée en ligne (annulation par le client ou l'administration,
+ * paiement tardif ou en double). Ne bloque jamais l'annulation : en cas d'échec, l'administration est
+ * prévenue et le remboursement reste « à traiter » (bouton Rembourser).
+ */
+export async function autoRefund(orderId, reason = 'Commande annulée') {
+  const pending = await queryOne(`SELECT id FROM refunds WHERE order_id = ? AND status = 'pending' LIMIT 1`, [orderId]);
+  if (!pending) return null;
+  try {
+    return await requestRefund(orderId, { reason }, null);
+  } catch (e) {
+    const order = await queryOne(`SELECT order_number FROM orders WHERE id = ?`, [orderId]);
+    console.error('[REMBOURSEMENT AUTO]', order?.order_number, e.message);
+    if (!e.adminsNotified) await notifyAdmins({
+      type: 'refund',
+      title: 'Remboursement automatique impossible',
+      body: `Commande ${order?.order_number} : ${e.message} Remboursez depuis le détail de la commande.`,
+      link: `/admin/commandes/${orderId}`,
+    });
+    return { status: 'failed', error: e.message };
+  }
 }
 
 // =====================================================================
@@ -373,6 +405,11 @@ export async function requestRefund(orderId, { amount: wanted, reason }, actorId
     await query(`UPDATE refunds SET status = 'failed', failure_reason = ? WHERE id = ?`, ['Numéro Mobile Money du client inconnu', refundId]);
     throw badRequest('Numéro Mobile Money du client introuvable : remboursez-le manuellement.');
   }
+  // Jèko refuse les virements de moins de 5 FCFA (500 centimes)
+  if (jeko.toCents(amount) < 500) {
+    await query(`UPDATE refunds SET status = 'failed', failure_reason = ? WHERE id = ?`, ['Montant inférieur au minimum Jèko (5 FCFA)', refundId]);
+    throw badRequest(`Montant de ${amount} FCFA inférieur au minimum de virement Jèko (5 FCFA) : remboursez manuellement.`);
+  }
   return sendTransfer('refund', refundId, {
     amount, reference, method: payment.provider, phone, name: `${user.first_name} ${user.last_name}`,
     description: `Remboursement commande ${order.order_number}`,
@@ -430,6 +467,7 @@ async function sendTransfer(kind, id, params, actorId) {
     t = await jeko.createTransfer(params);
   } catch (e) {
     await applyTransferResult(params.reference, 'error', null, e.message, kind);
+    e.adminsNotified = true; // applyTransferResult a déjà prévenu l'administration
     throw e;
   }
   await query(`UPDATE ${TRANSFER_TABLE[kind]} SET provider_reference = ? WHERE id = ?`, [t.id, id]);

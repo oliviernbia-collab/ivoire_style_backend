@@ -7,7 +7,7 @@ import { badRequest, created, notFound, ok, pageMeta, paginate } from '../utils/
 import {
   cancelOrder, createOrderFromCart, loadOrderDetail, ORDER_STATUS_LABELS, quoteOrder, resolveShopId,
 } from '../services/orders.js';
-import { providerInstructions } from '../services/payments.js';
+import { autoRefund, providerInstructions, refundMessage } from '../services/payments.js';
 import { deliveryOptions } from '../services/pricing.js';
 import { loadCart } from './cart.routes.js';
 import { getSetting, notifyAdmins } from '../services/common.js';
@@ -118,8 +118,9 @@ router.get('/:id/tracking', async (req, res) => {
 router.post('/:id/cancel', validate(z.object({ reason: z.string().trim().max(255).optional() })), async (req, res) => {
   await ownOrder(req);
   const r = await cancelOrder(Number(req.params.id), req.user, req.valid.reason || 'Annulée par le client');
-  ok(res, await loadOrderDetail(req.params.id),
-    r.refunding ? 'Commande annulée. Votre remboursement est en cours.' : 'Commande annulée avec succès');
+  // La part payée en ligne est remboursée automatiquement (virement Jèko vers le numéro qui a payé)
+  const refund = r.refunding ? await autoRefund(Number(req.params.id), 'Annulée par le client') : null;
+  ok(res, await loadOrderDetail(req.params.id), refundMessage(refund, 'Commande annulée avec succès'));
 });
 
 router.post('/:id/return', validate(z.object({

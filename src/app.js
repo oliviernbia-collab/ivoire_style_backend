@@ -15,6 +15,7 @@ import paymentsRoutes from './routes/payments.routes.js';
 import reviewsRoutes from './routes/reviews.routes.js';
 import sellerRoutes from './routes/seller.routes.js';
 import adminRoutes from './routes/admin.routes.js';
+import seoRoutes from './routes/seo.routes.js';
 
 const app = express();
 
@@ -53,6 +54,8 @@ v1.use('/payments', paymentsRoutes);
 v1.use('/seller', sellerRoutes);
 v1.use('/admin', adminRoutes);
 app.use('/api/v1', v1);
+// Référencement : robots.txt, sitemap.xml et aperçus des liens partagés (/partage/...)
+app.use('/', seoRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
