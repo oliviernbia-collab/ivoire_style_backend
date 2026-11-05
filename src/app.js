@@ -36,9 +36,11 @@ app.use(express.json({ limit: '1mb', verify: (req, _res, buf) => { req.rawBody =
 app.use(express.urlencoded({ extended: true, limit: '100kb', parameterLimit: 200 }));
 if (env.nodeEnv !== 'test') app.use(morgan(env.nodeEnv === 'production' ? 'combined' : 'dev'));
 
-// Réponses liées à un compte (profil, commandes, paiements…) : jamais conservées en cache (navigateur, proxy)
-app.use('/api', (req, res, next) => {
-  if (req.headers.authorization) res.set('Cache-Control', 'no-store');
+// Réponses de l'API jamais conservées en cache (navigateur, proxy, cache de l'hébergeur comme le Varnish de LWS) :
+// prix, stocks et frais de livraison changent à tout moment, et certaines réponses sont liées à un compte.
+// Les routes de référencement (robots.txt, sitemap, aperçus de partage) fixent leur propre durée de cache.
+app.use('/api/v1', (_req, res, next) => {
+  res.set('Cache-Control', 'no-store');
   next();
 });
 

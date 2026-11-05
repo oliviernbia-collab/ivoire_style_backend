@@ -16,7 +16,7 @@ export async function loadUser(userId) {
   );
   user.roles = roles.map((r) => r.code);
   const shop = await queryOne(
-    `SELECT id, name, slug, status, logo_url, rejection_reason, is_official FROM shops WHERE owner_user_id = ?`,
+    `SELECT id, name, slug, phone, status, logo_url, rejection_reason, is_official FROM shops WHERE owner_user_id = ?`,
     [userId],
   );
   if (shop) shop.is_official = Boolean(shop.is_official);

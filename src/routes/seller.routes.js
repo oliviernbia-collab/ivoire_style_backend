@@ -492,13 +492,28 @@ router.get('/orders', async (req, res) => {
   const where = ['oi.shop_id = ?', "oi.fulfillment_status <> 'pending'"];
   const params = [req.shopId];
   if (req.query.status) { where.push('oi.fulfillment_status = ?'); params.push(req.query.status); }
-  const [{ total }] = await query(`SELECT COUNT(DISTINCT oi.order_id) AS total FROM order_items oi WHERE ${where.join(' AND ')}`, params);
+  // Recherche (n° de commande, client, téléphone) et période (from / to, AAAA-MM-JJ)
+  const isDay = (d) => /^\d{4}-\d{2}-\d{2}$/.test(String(d || ''));
+  const orderWhere = [];
+  const orderParams = [];
+  const q = String(req.query.q || '').trim().slice(0, 80);
+  if (q) {
+    orderWhere.push('(o.order_number LIKE ? OR o.ship_recipient LIKE ? OR o.ship_phone LIKE ?)');
+    orderParams.push(`%${q}%`, `%${q}%`, `%${q}%`);
+  }
+  if (isDay(req.query.from)) { orderWhere.push('o.created_at >= ?'); orderParams.push(`${req.query.from} 00:00:00`); }
+  if (isDay(req.query.to)) { orderWhere.push('o.created_at <= ?'); orderParams.push(`${req.query.to} 23:59:59`); }
+  const orderFilter = orderWhere.length ? ` AND ${orderWhere.join(' AND ')}` : '';
+  const [{ total }] = await query(
+    `SELECT COUNT(*) AS total FROM orders o
+      WHERE o.id IN (SELECT DISTINCT oi.order_id FROM order_items oi WHERE ${where.join(' AND ')})${orderFilter}`,
+    [...params, ...orderParams]);
   const orders = await query(
     `SELECT o.id, o.order_number, o.created_at, o.payment_method, o.payment_status, o.payment_plan, o.delivery_mode,
             o.delivery_fee, o.total_amount, o.upfront_amount, o.balance_amount, o.balance_paid_at, o.discount_total, o.platform_fee, o.seller_commission,
             o.ship_recipient, o.ship_phone, o.ship_city, o.ship_commune, o.ship_district, o.ship_street, o.ship_instructions
-       FROM orders o WHERE o.id IN (SELECT DISTINCT oi.order_id FROM order_items oi WHERE ${where.join(' AND ')})
-      ORDER BY o.created_at DESC LIMIT ? OFFSET ?`, [...params, limit, offset]);
+       FROM orders o WHERE o.id IN (SELECT DISTINCT oi.order_id FROM order_items oi WHERE ${where.join(' AND ')})${orderFilter}
+      ORDER BY o.created_at DESC LIMIT ? OFFSET ?`, [...params, ...orderParams, limit, offset]);
   if (orders.length) {
     const items = await query(
       `SELECT oi.* FROM order_items oi WHERE oi.shop_id = ? AND oi.order_id IN (?) ORDER BY oi.id`,

@@ -10,7 +10,7 @@ DROP TABLE IF EXISTS audit_logs, notifications, platform_settings, promotion_pro
   reviews, seller_payouts, seller_ledger_entries, return_items, return_requests, shipments,
   refunds, payment_events, payments, order_status_history, order_items, orders,
   wishlist_items, cart_items, inventory_movements, product_variants, product_images, products,
-  categories, seller_documents, shops, password_resets, refresh_tokens, addresses, user_roles, roles, users;
+  categories, seller_documents, shops, login_handoffs, password_resets, refresh_tokens, addresses, user_roles, roles, users;
 
 SET FOREIGN_KEY_CHECKS = 1;
 
@@ -70,6 +70,17 @@ CREATE TABLE password_resets (
   used_at     DATETIME NULL,
   created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   CONSTRAINT fk_pr_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Passage de l'application au site web : codes de connexion à usage unique (2 minutes)
+CREATE TABLE login_handoffs (
+  id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  user_id     INT UNSIGNED NOT NULL,
+  code_hash   CHAR(64) NOT NULL UNIQUE,
+  expires_at  DATETIME NOT NULL,
+  used_at     DATETIME NULL,
+  created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_lh_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE addresses (

@@ -7,6 +7,7 @@ import {
   retryPendingRefunds, runAutoPayouts, syncPendingJekoPayments, syncProcessingTransfers,
 } from './services/payments.js';
 import { initRealtime } from './realtime.js';
+import { migrate } from '../database/migrations.js';
 
 /**
  * Toutes les routes vivent sous /api. En hébergement cPanel (Passenger, application montée sur /api), le préfixe
@@ -36,12 +37,39 @@ async function exclusive(name, task) {
   }
 }
 
+/**
+ * Base mise à jour avant de servir la moindre requête (déploiement continu : chaque nouvelle version migre la base
+ * à son démarrage). Verrou MySQL : si l'hébergeur lance plusieurs instances, une seule migre, les autres attendent.
+ */
+async function migrateDatabase() {
+  const conn = await pool.getConnection();
+  try {
+    const [[{ ok }]] = await conn.query(`SELECT GET_LOCK('ivs_migration', 120) AS ok`);
+    if (ok !== 1) throw new Error('verrou de migration indisponible après 2 minutes');
+    try {
+      const changes = await migrate(conn, (msg) => console.log(`[MIGRATION] ${msg}`));
+      if (changes) console.log(`[MIGRATION] ${changes} modification(s) appliquée(s)`);
+    } finally {
+      await conn.query(`SELECT RELEASE_LOCK('ivs_migration')`);
+    }
+  } finally {
+    conn.release();
+  }
+}
+
 async function start() {
   try {
     await pool.query('SELECT 1');
   } catch (err) {
     console.error(`Impossible de se connecter à MySQL (${env.db.host}/${env.db.database}) :`, err.message);
     console.error('Lancez MySQL (XAMPP) puis exécutez « npm run db:init ».');
+    process.exit(1);
+  }
+  // Une base incomplète ferait échouer des commandes ou des paiements : l'API refuse alors de démarrer
+  try {
+    await migrateDatabase();
+  } catch (err) {
+    console.error('Migration de la base impossible, API non démarrée :', err.message);
     process.exit(1);
   }
 

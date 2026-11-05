@@ -85,17 +85,45 @@ router.post('/', validate(orderSchema), async (req, res) => {
     `Commande ${order.order_number} enregistrée avec succès`);
 });
 
-router.get('/', async (req, res) => {
+// Filtres de « Mes commandes » : groupes de statuts lisibles par le client
+const ORDER_GROUPS = {
+  to_pay: ['pending'],
+  ongoing: ['confirmed', 'preparing', 'ready', 'shipped', 'in_delivery'],
+  delivered: ['delivered'],
+  returns: ['return_requested', 'return_accepted', 'return_rejected'],
+  cancelled: ['cancelled', 'refunding', 'refunded', 'partially_refunded'],
+};
+const day = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().catch(undefined);
+
+/** Commandes du client, filtrables : groupe de statuts, période (from / to, AAAA-MM-JJ), recherche (n° ou boutique). */
+router.get('/', validate(z.object({
+  status: z.enum(Object.keys(ORDER_GROUPS)).optional().catch(undefined),
+  from: day,
+  to: day,
+  q: z.string().trim().max(80).optional(),
+  page: z.coerce.number().int().min(1).optional().catch(undefined),
+  limit: z.coerce.number().int().min(1).optional().catch(undefined),
+}), 'query'), async (req, res) => {
+  const f = req.valid;
   const { page, limit, offset } = paginate(req.query, 10);
-  const [{ total }] = await query(`SELECT COUNT(*) AS total FROM orders WHERE user_id = ?`, [req.user.id]);
+  const where = ['o.user_id = ?'];
+  const params = [req.user.id];
+  if (f.status) { where.push(`o.status IN (${ORDER_GROUPS[f.status].map(() => '?').join(',')})`); params.push(...ORDER_GROUPS[f.status]); }
+  if (f.from) { where.push('o.created_at >= ?'); params.push(`${f.from} 00:00:00`); }
+  if (f.to) { where.push('o.created_at <= ?'); params.push(`${f.to} 23:59:59`); }
+  if (f.q) {
+    where.push('(o.order_number LIKE ? OR EXISTS (SELECT 1 FROM shops s WHERE s.id = o.shop_id AND s.name LIKE ?))');
+    params.push(`%${f.q}%`, `%${f.q}%`);
+  }
+  const [{ total }] = await query(`SELECT COUNT(*) AS total FROM orders o WHERE ${where.join(' AND ')}`, params);
   const rows = await query(
     `SELECT o.id, o.order_number, o.status, o.payment_status, o.payment_method, o.payment_plan, o.total_amount,
        o.upfront_amount, o.balance_amount, o.balance_paid_at, o.created_at,
        (SELECT s.name FROM shops s WHERE s.id = o.shop_id) AS shop_name,
        (SELECT COUNT(*) FROM order_items oi WHERE oi.order_id = o.id) AS item_count,
        (SELECT image_url FROM order_items oi WHERE oi.order_id = o.id ORDER BY oi.id LIMIT 1) AS image
-     FROM orders o WHERE o.user_id = ? ORDER BY o.created_at DESC LIMIT ? OFFSET ?`,
-    [req.user.id, limit, offset]);
+     FROM orders o WHERE ${where.join(' AND ')} ORDER BY o.created_at DESC LIMIT ? OFFSET ?`,
+    [...params, limit, offset]);
   rows.forEach((r) => { r.status_label = ORDER_STATUS_LABELS[r.status]; });
   ok(res, rows, null, pageMeta(page, limit, total));
 });

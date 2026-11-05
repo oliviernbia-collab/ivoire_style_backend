@@ -74,13 +74,15 @@ router.get('/products', optionalAuth, async (req, res) => {
   ok(res, items, null, pageMeta(page, limit, total));
 });
 
-/** Valeurs disponibles pour les filtres (tailles, couleurs, prix). */
-router.get('/products/filters', async (_req, res) => {
+/** Valeurs disponibles pour les filtres (tailles, couleurs, prix) ; ?shop=slug : celles d'une seule boutique. */
+router.get('/products/filters', async (req, res) => {
+  const shop = typeof req.query.shop === 'string' ? req.query.shop : '';
   const base = `FROM product_variants v JOIN products p ON p.id = v.product_id JOIN shops s ON s.id = p.shop_id
-                WHERE v.status = 'active' AND ${PUBLIC_WHERE}`;
-  const sizes = await query(`SELECT DISTINCT v.size ${base} ORDER BY FIELD(v.size,'XS','S','M','L','XL','XXL','3XL'), v.size`);
-  const colors = await query(`SELECT v.color, MAX(v.color_hex) AS hex ${base} GROUP BY v.color ORDER BY v.color`);
-  const [range] = await query(`SELECT MIN(v.price) AS min, MAX(v.price) AS max ${base}`);
+                WHERE v.status = 'active' AND ${PUBLIC_WHERE}${shop ? ' AND s.slug = ?' : ''}`;
+  const params = shop ? [shop] : [];
+  const sizes = await query(`SELECT DISTINCT v.size ${base} ORDER BY FIELD(v.size,'XS','S','M','L','XL','XXL','3XL'), v.size`, params);
+  const colors = await query(`SELECT v.color, MAX(v.color_hex) AS hex ${base} GROUP BY v.color ORDER BY v.color`, params);
+  const [range] = await query(`SELECT MIN(v.price) AS min, MAX(v.price) AS max ${base}`, params);
   ok(res, { sizes: sizes.map((s) => s.size), colors, price: range });
 });
 
@@ -158,7 +160,7 @@ router.get('/shops', async (req, res) => {
 
 router.get('/shops/:slug', async (req, res) => {
   const shop = await queryOne(
-    `SELECT s.id, s.name, s.slug, s.description, s.logo_url, s.banner_url, s.city, s.commune, s.created_at, s.is_official,
+    `SELECT s.id, s.name, s.slug, s.phone, s.description, s.logo_url, s.banner_url, s.city, s.commune, s.created_at, s.is_official,
        s.delivery_fee_abidjan, s.delivery_fee_other, s.free_delivery_threshold, s.allow_shop_pickup, s.delivery_info,
        (SELECT COUNT(*) FROM products p WHERE p.shop_id = s.id AND p.status = 'published') AS product_count,
        (SELECT ROUND(AVG(p.rating_avg), 1) FROM products p WHERE p.shop_id = s.id AND p.rating_count > 0) AS rating,

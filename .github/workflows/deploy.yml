@@ -1,0 +1,92 @@
+# Déploiement continu de l'API sur l'hébergement LWS (FTP chiffré), à chaque envoi sur main.
+# La base de données est migrée par l'API elle-même à son démarrage (database/migrations.js).
+# Secrets GitHub : FTP_SERVER, FTP_USERNAME, FTP_PASSWORD. Variable facultative : FTP_DIR (dossier de l'API vu par
+# ce compte FTP, « ./ » par défaut pour un compte FTP limité au dossier backendivoirestyle). Voir DEPLOIEMENT.md.
+name: Déploiement API
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Un seul déploiement à la fois ; un envoi suivant attend la fin du précédent
+concurrency:
+  group: deploiement-api
+  cancel-in-progress: false
+
+jobs:
+  deployer:
+    name: Vérification et mise en ligne
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Syntaxe de tous les fichiers
+        run: for f in $(git ls-files '*.js' '*.cjs'); do node --check "$f"; done
+      - name: Chargement de l'application (routes et dépendances)
+        env:
+          NODE_ENV: test
+        run: node -e "import('./src/app.js').then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); })"
+
+      - name: Dépendances modifiées ?
+        id: deps
+        run: |
+          BEFORE="${{ github.event.before }}"
+          if [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+             && ! git diff --quiet "$BEFORE" HEAD -- package.json package-lock.json; then
+            echo "changed=1" >> "$GITHUB_OUTPUT"
+            echo "::warning::package.json a changé : après ce déploiement, cliquez sur « Run NPM Install » puis « Restart » dans Setup Node.js App (cPanel)."
+          fi
+
+      - name: Envoi du code
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          local-dir: ./
+          server-dir: ${{ vars.FTP_DIR || './' }}
+          # Fichiers propres au serveur (.env, node_modules…) : jamais envoyés ni supprimés
+          exclude: |
+            **/.git*
+            **/.git*/**
+            .github/**
+            **/node_modules/**
+            .env
+            .env.*
+            uploads/**
+            tmp/**
+            *.log
+
+      # Passenger redémarre l'application quand tmp/restart.txt change ; la nouvelle version migre alors la base
+      - name: Redémarrage de l'API
+        run: mkdir -p restart/tmp && echo "${{ github.sha }} $(date -u +%FT%TZ)" > restart/tmp/restart.txt
+      - uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          local-dir: ./restart/
+          server-dir: ${{ vars.FTP_DIR || './' }}
+          state-name: .ftp-deploy-restart.json
+
+      - name: Contrôle de l'API en ligne
+        run: |
+          for i in $(seq 1 18); do
+            if curl -fsS https://ivoire-style.site/api/v1/health; then echo; exit 0; fi
+            sleep 5
+          done
+          if [ "${{ steps.deps.outputs.changed }}" = "1" ]; then
+            echo "::error::Dépendances modifiées : cliquez sur « Run NPM Install » puis « Restart » dans Setup Node.js App."
+          else
+            echo "::error::L'API ne répond pas : voir stderr.log dans backendivoirestyle (cPanel > Gestionnaire de fichiers)."
+          fi
+          exit 1

@@ -137,6 +137,33 @@ router.post('/refresh', refreshLimiter, async (req, res) => {
   ok(res, { user, ...tokens });
 });
 
+/**
+ * Passage de l'application au site web (ex. « Ouvrir l'espace vendeur web ») : le navigateur du téléphone n'a pas
+ * la session de l'application. L'application demande un code à usage unique valable 2 minutes, le site l'échange
+ * contre une session du même compte. Seule l'empreinte du code est enregistrée.
+ */
+router.post('/handoff', requireAuth, async (req, res) => {
+  const code = crypto.randomBytes(32).toString('hex');
+  await query(`DELETE FROM login_handoffs WHERE user_id = ? AND (used_at IS NOT NULL OR expires_at < NOW())`, [req.user.id]);
+  await query(`INSERT INTO login_handoffs (user_id, code_hash, expires_at) VALUES (?, ?, DATE_ADD(NOW(), INTERVAL 2 MINUTE))`,
+    [req.user.id, sha256(code)]);
+  ok(res, { code });
+});
+
+router.post('/handoff/redeem', sensitiveLimiter, validate(z.object({ code: z.string().regex(/^[a-f0-9]{64}$/) })), async (req, res) => {
+  const expired = unauthorized('Ce lien de connexion a expiré. Rouvrez-le depuis l’application.');
+  const row = await queryOne(
+    `SELECT id, user_id FROM login_handoffs WHERE code_hash = ? AND used_at IS NULL AND expires_at > NOW()`, [sha256(req.valid.code)]);
+  if (!row) throw expired;
+  // Usage unique, même si deux requêtes arrivent en même temps
+  const used = await query(`UPDATE login_handoffs SET used_at = NOW() WHERE id = ? AND used_at IS NULL`, [row.id]);
+  if (!used.affectedRows) throw expired;
+  const user = await loadUser(row.user_id);
+  if (!user || user.status !== 'active') throw expired;
+  await audit({ ip: req.ip, user: { id: user.id } }, 'auth.handoff', 'user', user.id);
+  ok(res, { user, ...(await issueTokens(user.id, req)) }, 'Connexion réussie');
+});
+
 router.post('/logout', async (req, res) => {
   const token = req.body?.refresh_token;
   if (token) await query(`UPDATE refresh_tokens SET revoked_at = NOW() WHERE token_hash = ?`, [sha256(token)]);

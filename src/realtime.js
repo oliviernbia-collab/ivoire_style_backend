@@ -27,6 +27,10 @@ export function initRealtime(httpServer) {
     },
   });
 
+  // Requêtes de « long polling » jamais mises en cache par un proxy de l'hébergeur
+  io.engine.on('initial_headers', (headers) => { headers['Cache-Control'] = 'no-store'; });
+  io.engine.on('headers', (headers) => { headers['Cache-Control'] = 'no-store'; });
+
   // Authentification par le jeton d'accès (le même que pour l'API)
   io.use(async (socket, next) => {
     try {
