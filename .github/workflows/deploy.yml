@@ -48,7 +48,11 @@ jobs:
             echo "::warning::package.json a changé : après ce déploiement, cliquez sur « Run NPM Install » puis « Restart » dans Setup Node.js App (cPanel)."
           fi
 
+      # Le serveur FTP de LWS refuse les reconnexions trop rapprochées : pauses entre les envois et nouvel essai
+      # en cas d'échec. Fichiers propres au serveur (.env, node_modules…) : jamais envoyés ni supprimés.
       - name: Envoi du code
+        id: code
+        continue-on-error: true
         uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
           server: ${{ secrets.FTP_SERVER }}
@@ -57,7 +61,29 @@ jobs:
           protocol: ftps
           local-dir: ./
           server-dir: ${{ vars.FTP_DIR || './' }}
-          # Fichiers propres au serveur (.env, node_modules…) : jamais envoyés ni supprimés
+          exclude: |
+            **/.git*
+            **/.git*/**
+            .github/**
+            **/node_modules/**
+            .env
+            .env.*
+            uploads/**
+            tmp/**
+            *.log
+      - name: Pause avant un nouvel essai
+        if: steps.code.outcome == 'failure'
+        run: sleep 60
+      - name: Envoi du code (nouvel essai)
+        if: steps.code.outcome == 'failure'
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          local-dir: ./
+          server-dir: ${{ vars.FTP_DIR || './' }}
           exclude: |
             **/.git*
             **/.git*/**
@@ -70,9 +96,28 @@ jobs:
             *.log
 
       # Passenger redémarre l'application quand tmp/restart.txt change ; la nouvelle version migre alors la base
+      - name: Préparation du redémarrage
+        run: |
+          mkdir -p restart/tmp && echo "${{ github.sha }} $(date -u +%FT%TZ)" > restart/tmp/restart.txt
+          sleep 30
       - name: Redémarrage de l'API
-        run: mkdir -p restart/tmp && echo "${{ github.sha }} $(date -u +%FT%TZ)" > restart/tmp/restart.txt
-      - uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        id: restart
+        continue-on-error: true
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+        with:
+          server: ${{ secrets.FTP_SERVER }}
+          username: ${{ secrets.FTP_USERNAME }}
+          password: ${{ secrets.FTP_PASSWORD }}
+          protocol: ftps
+          local-dir: ./restart/
+          server-dir: ${{ vars.FTP_DIR || './' }}
+          state-name: .ftp-deploy-restart.json
+      - name: Pause avant un nouvel essai
+        if: steps.restart.outcome == 'failure'
+        run: sleep 60
+      - name: Redémarrage de l'API (nouvel essai)
+        if: steps.restart.outcome == 'failure'
+        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
         with:
           server: ${{ secrets.FTP_SERVER }}
           username: ${{ secrets.FTP_USERNAME }}
