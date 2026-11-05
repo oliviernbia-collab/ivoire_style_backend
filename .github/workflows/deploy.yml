@@ -32,6 +32,10 @@ jobs:
       - name: Chargement de l'application (routes et dépendances)
         env:
           NODE_ENV: test
+          # Valeurs factices : l'API exige une configuration Cloudinary pour se charger (aucun appel n'est fait ici)
+          CLOUDINARY_CLOUD_NAME: verification
+          CLOUDINARY_API_KEY: verification
+          CLOUDINARY_API_SECRET: verification
         run: node -e "import('./src/app.js').then(() => process.exit(0)).catch((e) => { console.error(e); process.exit(1); })"
 
       - name: Dépendances modifiées ?
